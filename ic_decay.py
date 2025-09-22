@@ -7,6 +7,10 @@
             没有wandb版本
 @History :
 
+- 2025/09/21, v1.2, dizjia:
+  - 添加了ASR指标
+- 2025/09/19, v1.1, dizjia:
+  - 在后门攻击上进行实验
 """
 
 
@@ -32,7 +36,7 @@ config = {
     "SEED": 42,
 
     # 实验日志文件路径
-    "LOG_FILE_PATH": "./ic_ddw_simulation_log_scene3.csv",
+    "LOG_FILE_PATH": "./log/ic_decay_simulation/scene2.csv",
 
     # 联邦学习设置
     "NUM_CLIENTS": 20,  # 增加客户端总数以更好地模拟统计检测
@@ -44,22 +48,25 @@ config = {
     "BATCH_SIZE": 32,
     "LEARNING_RATE": 0.01,
 
-    # 攻击设置
-    "ATTACK_TYPE": "label_flipping",  # "label_flipping" 或 "backdoor"
-    "MALICIOUS_CLIENTS": 8,  # 20个客户端里有多少个是恶意的
-    "POISON_RATIO": 1,  # 恶意客户端的数据污染率
+    # 攻击设置 (当前为后门攻击)
+    "ATTACK_TYPE": "backdoor",
+    "MALICIOUS_CLIENTS": 10,
+    "POISON_RATIO": 1,
+    "BACKDOOR_TRIGGER_SIZE": 5,
+    "BACKDOOR_TARGET_LABEL": 0,
 
     # 防御设置 (核心)
     "DEFENSE_ENABLED": True,  # 是否启用在线防御
     "DEFENSE_START_ROUND": 5,  # 从第5轮开始执行防御，给模型一点初始收敛时间
-    "SUSPICIOUS_CLIENT_WEIGHT": 0.2, # 可疑客户端在聚合中的权重
-    "REPUTATION_THRESHOLD": 3,  # 声誉分累计超过3次则被移除
-    "REPUTATION_DECAY_FACTOR": 0.8, # γ值 (gamma)
+
+    # IDA+余弦相似度模块参数
+    "PERTURBATION_STRENGTH": 0.1,  # 扰动强度
     "OUTLIER_THRESHOLD": 3.0,  # 判断异常的阈值（超过中位数3个MAD）
     "SIMILARITY_THRESHOLD" :0.2,    #相似度阈值
-    "PERTURBATION_STRENGTH": 0.1,  # 扰动强度
-    "is_max": False,    # True使用 max,否则使用 mean
-
+    # 声誉与降权模块参数
+    "REPUTATION_THRESHOLD": 3,  # 声誉分累计超过3次则被移除
+    "REPUTATION_DECAY_FACTOR": 0.8, # γ值 (gamma)
+    "SUSPICIOUS_CLIENT_WEIGHT": 0.2, # 可疑客户端在聚合中的权重
 
     # 学习率调度器 (Scheduler) 设置
     "SCHEDULER_ENABLED": True,
@@ -142,6 +149,81 @@ def create_iid_partitions(dataset, num_clients):
     return [Subset(dataset, list(idxs)) for _, idxs in dict_users.items()]
 
 
+class BackdoorDataset(Dataset):
+    """
+    一个为数据集植入后门攻击的包装器。
+    它会在一部分图片上粘贴一个触发器（例如，右下角的白色方块），
+    并将其标签修改为指定的目标标签。
+    """
+
+    def __init__(self, original_dataset, poison_ratio, trigger_size, target_label):
+        self.original_dataset = original_dataset
+        self.poison_ratio = poison_ratio
+        self.trigger_size = trigger_size
+        self.target_label = target_label
+
+        # 随机选择要投毒的样本索引
+        self.poison_indices = set(np.random.choice(
+            len(self), int(len(self) * self.poison_ratio), replace=False
+        ))
+
+    def __len__(self):
+        return len(self.original_dataset)
+
+    def __getitem__(self, idx):
+        # 获取原始图片和标签
+        img, label = self.original_dataset[idx]
+
+        # 如果当前样本需要被投毒
+        if idx in self.poison_indices:
+            # 1. 修改标签
+            label = self.target_label
+
+            # 2. 在图片上粘贴触发器
+            # 我们将触发器放在右下角
+            # img 的形状是 (C, H, W)，例如 (3, 32, 32)
+            c, h, w = img.shape
+            # 将右下角的一个 trigger_size x trigger_size 的区域像素值设为最大值 (白色)
+            img[:, h - self.trigger_size:, w - self.trigger_size:] = 1.0
+
+        return img, label
+
+
+def evaluate_backdoor_asr(model, test_loader, device, config):
+    """
+    计算后门攻击的攻击成功率 (ASR)。
+    """
+    model.eval()
+    success, total = 0, 0
+
+    trigger_size = config["BACKDOOR_TRIGGER_SIZE"]
+    target_label = config["BACKDOOR_TARGET_LABEL"]
+
+    with torch.no_grad():
+        for data, target in test_loader:
+            # 筛选出那些不是目标标签的图片
+            non_target_mask = (target != target_label)
+            data, target = data[non_target_mask], target[non_target_mask]
+
+            if data.size(0) == 0: continue
+
+            data = data.to(device)
+            total += data.size(0)
+
+            # 在图片上粘贴触发器
+            c, h, w = data.shape[1:]
+            data[:, :, h - trigger_size:, w - trigger_size:] = 1.0
+
+            # 进行预测
+            outputs = model(data)
+            _, predicted = torch.max(outputs.data, 1)
+
+            # 如果预测结果等于目标标签，则攻击成功
+            success += (predicted == target_label).sum().item()
+
+    return (success / total) * 100 if total > 0 else 0
+
+
 class LabelFlippingDataset(Dataset):
     def __init__(self, original_dataset, poison_ratio, num_classes=10):
         self.original_dataset, self.poison_ratio, self.num_classes = original_dataset, poison_ratio, num_classes
@@ -164,7 +246,17 @@ class Client:
         self.client_id, self.local_data, self.is_malicious = client_id, local_data, is_malicious
         self.device = config["DEVICE"]
         if is_malicious:
-            self.local_data = LabelFlippingDataset(local_data, poison_ratio=config["POISON_RATIO"])
+            # [核心修正] 根据ATTACK_TYPE来选择攻击方式
+            if config["ATTACK_TYPE"] == "label_flipping":
+                self.local_data = LabelFlippingDataset(local_data, poison_ratio=config["POISON_RATIO"])
+            elif config["ATTACK_TYPE"] == "backdoor":
+                # (确保您代码中已经定义了BackdoorDataset类)
+                self.local_data = BackdoorDataset(
+                    original_dataset=local_data,
+                    poison_ratio=config["POISON_RATIO"],
+                    trigger_size=config["BACKDOOR_TRIGGER_SIZE"],
+                    target_label=config["BACKDOOR_TARGET_LABEL"]
+                )
         self.dataloader = DataLoader(self.local_data, batch_size=config["BATCH_SIZE"], shuffle=True)
 
     def train(self, global_model_state_dict, learning_rate):
@@ -175,7 +267,7 @@ class Client:
         # [修改] 差异化本地训练轮数
         epochs_to_run = config["LOCAL_EPOCHS"]
         if self.is_malicious:
-            epochs_to_run = config["LOCAL_EPOCHS"] * 2  # 例如，恶意客户端的训练轮数是诚实的2倍
+            epochs_to_run = config["LOCAL_EPOCHS"] * 4  # 例如，恶意客户端的训练轮数是诚实的2倍
             # 您也可以在这里设置一个固定的更多轮数，比如 10
 
         model.train()
@@ -223,7 +315,7 @@ def calculate_instability_score(model_state_dict, probe_images, device, config):
         config (dict): 全局配置字典。
 
     Returns:
-        float: 模型的不稳定性分数（最大余弦不相似度）。
+        float: 模型的不稳定性分数（平均余弦不相似度）。
     """
     model = SimpleCNN().to(device)
     model.load_state_dict(model_state_dict)
@@ -239,7 +331,7 @@ def calculate_instability_score(model_state_dict, probe_images, device, config):
             features_X_prime = model.get_penultimate_features(probe_X_prime)
             scores.append(1 - nn.functional.cosine_similarity(features_X, features_X_prime).item())
 
-    return np.max(scores)
+    return np.mean(scores)
 
 
 
@@ -292,7 +384,7 @@ class Server:
 
     def _generate_probes(self):
         # [修改] 从预先计算好的文件中加载基于特征聚类的探针图片索引
-        probe_indices_file = "../ida_simulation/clustered_probe_indices_for_cifar10.npy"
+        probe_indices_file = "ida_simulation/clustered_probe_indices_for_cifar10.npy"
         try:
             # 加载预先计算好的索引
             indices = np.load(probe_indices_file)
@@ -319,6 +411,20 @@ class Server:
 
                 num_to_select = min(self.config["CLIENTS_PER_ROUND"], len(self.active_clients_pool))
                 selected_clients = random.sample(self.active_clients_pool, num_to_select)
+
+                # --- [新增代码] 打印本轮选中的恶意客户端ID ---
+                # 检查当前是否为场景二 (有攻击 & 无防御)
+                is_attack_no_defense_scenario = self.config.get("MALICIOUS_CLIENTS", 0) > 0 and \
+                                                not self.config.get("DEFENSE_ENABLED", False)
+
+                if is_attack_no_defense_scenario:
+                    # 从选中的客户端中筛选出恶意的，并记录他们的ID
+                    selected_malicious_ids = sorted([
+                        client.client_id for client in selected_clients if client.is_malicious
+                    ])
+                    print(
+                        f"    [攻击监控] 本轮选中了 {len(selected_malicious_ids)} 个恶意客户端: {selected_malicious_ids}")
+
                 client_updates = {}
                 global_model_state_dict = self.global_model.state_dict()
                 current_lr = self.optimizer.param_groups[0]['lr']
@@ -371,6 +477,7 @@ class Server:
                         for client_id, delta in deltas.items():
                             score_mad = (delta - median) / mad
                             similarity_score = similarities.get(client_id, 1.0)
+                            # 这里需要测试用 or和 and哪个效果更好
                             if score_mad > self.config["OUTLIER_THRESHOLD"] or similarity_score < SIMILARITY_THRESHOLD:
                                 suspicious_ids.append(client_id)
 
@@ -505,8 +612,6 @@ if __name__ == "__main__":
         # --- 场景一: 无攻击 ---
         print("\n\n=============== 场景一: 无攻击环境 ===============")
 
-
-
         config_no_attack = copy.deepcopy(config)
         config_no_attack["MALICIOUS_CLIENTS"] = 0
         config_no_attack["DEFENSE_ENABLED"] = False
@@ -516,6 +621,12 @@ if __name__ == "__main__":
         # 将更新后的config传入Server
         server_no_attack = Server(clients_no_attack, test_loader, config_no_attack)
         history_no_attack = server_no_attack.run_simulation()
+
+        # [新增] 计算最终的ASR
+        final_asr = evaluate_backdoor_asr(server_no_attack.global_model, test_loader, config["DEVICE"],
+                                          config_no_attack)
+        print(f"    [评估] 最终攻击成功率 (ASR): {final_asr:.2f}%")
+
         ### 修改 ###: 复用通用参数，并添加场景特定参数
         params_log_1 = common_params_to_log.copy()
         # 场景一没有攻击和防御，用 N/A 覆盖
@@ -524,14 +635,17 @@ if __name__ == "__main__":
             "POISON_RATIO": "N/A",
             "PERTURBATION_STRENGTH": "N/A",
             "OUTLIER_THRESHOLD": "N/A",
-            "REPUTATION_THRESHOLD": "N/A"
+            "REPUTATION_THRESHOLD": "N/A",
+            "SIMILARITY_THRESHOLD": config.get("SIMILARITY_THRESHOLD", "N/A"),
+            "REPUTATION_DECAY_FACTOR": config.get("REPUTATION_DECAY_FACTOR", "N/A")
         })
         actual_rounds_1 = len(history_no_attack['accuracy'])
         metrics_log_1 = {
             "actual_rounds": actual_rounds_1,
             "final_accuracy": f"{history_no_attack['accuracy'][-1] * 100:.2f}%",
             "malicious_removed": "N/A",
-            "benign_removed": "N/A"
+            "benign_removed": "N/A",
+            "final_asr": f"{final_asr:.2f}%",
         }
         log_experiment_results(config["LOG_FILE_PATH"], "1", params_log_1, metrics_log_1)
 
@@ -540,8 +654,6 @@ if __name__ == "__main__":
     if 2 in scenarios_to_run:
         # --- 场景二: 有攻击, 无防御 ---
         print("\n\n=============== 场景二: 有攻击, 无防御 ===============")
-
-
 
         config_under_attack = copy.deepcopy(config)
         config_under_attack["DEFENSE_ENABLED"] = False
@@ -555,6 +667,12 @@ if __name__ == "__main__":
 
         server_under_attack = Server(clients_under_attack, test_loader, config_under_attack)
         history_under_attack = server_under_attack.run_simulation()
+
+        # [新增] 计算最终的ASR
+        final_asr = evaluate_backdoor_asr(server_under_attack.global_model, test_loader, config["DEVICE"],
+                                          config_under_attack)
+        print(f"    [评估] 最终攻击成功率 (ASR): {final_asr:.2f}%")
+
         ### 修改 ###: 复用通用参数，并添加场景特定参数
         params_log_2 = common_params_to_log.copy()
         params_log_2.update({
@@ -562,14 +680,17 @@ if __name__ == "__main__":
             "POISON_RATIO": config["POISON_RATIO"],
             "PERTURBATION_STRENGTH": "N/A",
             "OUTLIER_THRESHOLD": "N/A",
-            "REPUTATION_THRESHOLD": "N/A"
+            "REPUTATION_THRESHOLD": "N/A",
+            "SIMILARITY_THRESHOLD": config.get("SIMILARITY_THRESHOLD", "N/A"),
+            "REPUTATION_DECAY_FACTOR": config.get("REPUTATION_DECAY_FACTOR", "N/A")
         })
         actual_rounds_2 = len(history_under_attack['accuracy'])
         metrics_log_2 = {
             "actual_rounds": actual_rounds_2,
             "final_accuracy": f"{history_under_attack['accuracy'][-1] * 100:.2f}%",
             "malicious_removed": "N/A",
-            "benign_removed": "N/A"
+            "benign_removed": "N/A",
+            "final_asr": f"{final_asr:.2f}%"
         }
         log_experiment_results(config["LOG_FILE_PATH"], "2", params_log_2, metrics_log_2)
 
@@ -577,8 +698,6 @@ if __name__ == "__main__":
     if 3 in scenarios_to_run:
         # --- 场景三: 有攻击, 有您的IDA防御 ---
         print("\n\n=============== 场景三: 有攻击, 启用IDA防御 ===============")
-
-
 
         config_with_defense = copy.deepcopy(config)
         config_with_defense["DEFENSE_ENABLED"] = True
@@ -593,6 +712,12 @@ if __name__ == "__main__":
 
         server_with_defense = Server(clients_with_defense, test_loader, config_with_defense)
         history_with_defense = server_with_defense.run_simulation()
+
+        # [新增] 计算最终的ASR
+        final_asr = evaluate_backdoor_asr(server_with_defense.global_model, test_loader, config["DEVICE"],
+                                          config_with_defense)
+        print(f"    [评估] 最终攻击成功率 (ASR): {final_asr:.2f}%")
+
         ### 修改 ###: 复用通用参数，并添加场景特定参数
         params_log_3 = common_params_to_log.copy()
         params_log_3.update({
@@ -600,105 +725,121 @@ if __name__ == "__main__":
             "POISON_RATIO": config["POISON_RATIO"],
             "PERTURBATION_STRENGTH": config["PERTURBATION_STRENGTH"],
             "OUTLIER_THRESHOLD": config["OUTLIER_THRESHOLD"],
-            "REPUTATION_THRESHOLD": config["REPUTATION_THRESHOLD"]
+            "REPUTATION_THRESHOLD": config["REPUTATION_THRESHOLD"],
+            "SIMILARITY_THRESHOLD": config.get("SIMILARITY_THRESHOLD", "N/A"),
+            "REPUTATION_DECAY_FACTOR": config.get("REPUTATION_DECAY_FACTOR", "N/A")
         })
         actual_rounds_3 = len(history_with_defense['accuracy'])
+        # [修改] 2. 正确地统计并记录最终被“降权”的客户端数量
+        # 对于“指数衰减”策略，我们定义“被降权”为最终声誉分 > 0 的客户端
+        final_reputations = server_with_defense.reputation_scores
+        convicted_clients = {cid for cid, rep in final_reputations.items() if rep > 0}
+
+        malicious_clients_config = config_with_defense["MALICIOUS_CLIENTS"]
+        downweighted_malicious_count = len([cid for cid in convicted_clients if cid < malicious_clients_config])
+        downweighted_benign_count = len([cid for cid in convicted_clients if cid >= malicious_clients_config])
+
         metrics_log_3 = {
             "actual_rounds": actual_rounds_3,
             "final_accuracy": f"{history_with_defense['accuracy'][-1] * 100:.2f}%",
-            "malicious_removed": len(set(history_with_defense['removed_malicious'])),
-            "benign_removed": len(set(history_with_defense['removed_benign']))
+            "downweighted_malicious": downweighted_malicious_count,
+            "downweighted_benign": downweighted_benign_count,
+            "final_asr": f"{final_asr:.2f}%"
         }
         log_experiment_results(config["LOG_FILE_PATH"], "3", params_log_3, metrics_log_3)
 
     # print(f"\n[日志] 所有场景已成功记录到: {config['LOG_FILE_PATH']}")
 
+        # --- 4. 结果可视化 ---
+        # [修改] 将两个图的绘制逻辑分得更清晰
 
-    # --- 4. 结果可视化 ---
-    # [修改] 4. 让绘图代码更健壮，只绘制实际运行过的场景
-    plt.figure(figsize=(10, 6))
-    max_rounds = 0
+        # --- 图表一：准确率对比 ---
+        plt.figure(figsize=(10, 6))
+        max_rounds_acc = 0
 
-    if history_no_attack:
-        rounds = len(history_no_attack['accuracy'])
-        max_rounds = max(max_rounds, rounds)
-        plt.plot(range(1, rounds + 1), history_no_attack['accuracy'], 'g-s',
-                 label=f'No Attack (Converged in {rounds} rounds)')
+        if history_no_attack:
+            rounds = len(history_no_attack['accuracy'])
+            max_rounds_acc = max(max_rounds_acc, rounds)
+            plt.plot(range(1, rounds + 1), history_no_attack['accuracy'], 'g-s',
+                     label=f'No Attack (Converged in {rounds} rounds)')
 
-    if history_under_attack:
-        rounds = len(history_under_attack['accuracy'])
-        max_rounds = max(max_rounds, rounds)
-        plt.plot(range(1, rounds + 1), history_under_attack['accuracy'], 'r-x',
-                 label=f'Under Attack (Ran for {rounds} rounds)')
+        if history_under_attack:
+            rounds = len(history_under_attack['accuracy'])
+            max_rounds_acc = max(max_rounds_acc, rounds)
+            plt.plot(range(1, rounds + 1), history_under_attack['accuracy'], 'r-x',
+                     label=f'Under Attack (Ran for {rounds} rounds)')
 
-    # --- [核心修改] 防御效果总结 (适配新的“永久降权”逻辑) ---
-    if history_with_defense:
-        print("\n--- 防御效果总结 ---")
+        # [修正] 补上缺失的 "With Defense" 准确率曲线
+        if history_with_defense:
+            rounds = len(history_with_defense['accuracy'])
+            max_rounds_acc = max(max_rounds_acc, rounds)
+            plt.plot(range(1, rounds + 1), history_with_defense['accuracy'], 'b-o',
+                     label=f'With IDA Defense (Converged in {rounds} rounds)')
 
-        # 从server对象中获取最终被永久降权的客户端ID集合
-        convicted_clients = server_with_defense.permanently_downweighted_clients
+        if max_rounds_acc > 0:
+            plt.title("Performance Comparison of IDA Online Defense (Accuracy)")
+            plt.xlabel("Federated Learning Round")
+            plt.ylabel("Global Model Test Accuracy")
+            plt.legend()
+            plt.grid(True)
+            plt.ylim(0, 1)
+            plt.xlim(0, max_rounds_acc + 5)
+            plt.show()
+        else:
+            # 如果一个场景都没跑，就打印提示
+            print("\n[可视化] 未运行任何场景，无法绘制准确率图。")
 
-        # 判断其中哪些是恶意的，哪些是良性的
-        malicious_clients_config = config_with_defense["MALICIOUS_CLIENTS"]
-        downweighted_malicious = sorted([cid for cid in convicted_clients if cid < malicious_clients_config])
-        downweighted_benign = sorted([cid for cid in convicted_clients if cid >= malicious_clients_config])
+        # --- 图表二：损失值对比 ---
+        plt.figure(figsize=(12, 7))
+        max_rounds_loss = 0
 
-        print(f"被成功永久降权的恶意客户端 ({len(downweighted_malicious)}个): {downweighted_malicious}")
-        print(f"被错误永久降权的良性客户端 ({len(downweighted_benign)}个): {downweighted_benign}")
+        if history_no_attack:
+            rounds = len(history_no_attack['loss'])
+            max_rounds_loss = max(max_rounds_loss, rounds)
+            plt.plot(range(1, rounds + 1), history_no_attack['loss'], 'g-s',
+                     label=f'No Attack (Converged in {rounds} rounds)')
 
-    # 只有在未运行任何场景时，才打印提示
-    if not history_no_attack and not history_under_attack and not history_with_defense:
-        print("\n[可视化] 未运行任何场景，无需绘图。")
+        if history_under_attack:
+            rounds = len(history_under_attack['loss'])
+            max_rounds_loss = max(max_rounds_loss, rounds)
+            plt.plot(range(1, rounds + 1), history_under_attack['loss'], 'r-x',
+                     label=f'Under Attack (Ran for {rounds} rounds)')
 
-    # 只有在至少绘制了一条线时才显示图表
-    if max_rounds > 0:
-        plt.title("Performance Comparison of IDA Online Defense")
-        plt.xlabel("Federated Learning Round")
-        plt.ylabel("Global Model Test Accuracy")
-        plt.legend()
-        plt.grid(True)
-        plt.ylim(0, 1)
-        plt.xlim(0, max_rounds + 5)
-        plt.show()
+        if history_with_defense:
+            rounds = len(history_with_defense['loss'])
+            max_rounds_loss = max(max_rounds_loss, rounds)
+            plt.plot(range(1, rounds + 1), history_with_defense['loss'], 'b-o',
+                     label=f'With IDA Defense (Converged in {rounds} rounds)')
 
-    # --- 图表二：损失值对比 ---
-    plt.figure(figsize=(12, 7))
-    max_rounds_loss = 0
+        if max_rounds_loss > 0:
+            plt.title("Performance Comparison of IDA Online Defense (Loss)")
+            plt.xlabel("Federated Learning Round")
+            plt.ylabel("Global Model Test Loss")
+            plt.legend()
+            plt.grid(True)
+            plt.ylim(bottom=0)
+            plt.xlim(0, max_rounds_loss + 5)
+            plt.show()
+        else:
+            print("\n[可视化] 未运行任何场景，无法绘制损失图。")
 
-    if history_no_attack:
-        rounds = len(history_no_attack['loss'])
-        max_rounds_loss = max(max_rounds_loss, rounds)
-        # 注意：这里的数据源改为了 history_no_attack['loss']
-        plt.plot(range(1, rounds + 1), history_no_attack['loss'], 'g-s',
-                 label=f'No Attack (Converged in {rounds} rounds)')
+        # --- [修正] 将防御效果总结的打印逻辑移到所有绘图之后 ---
+        if history_with_defense:
+            print("\n--- 防御效果总结 ---")
+            final_reputations = server_with_defense.reputation_scores
+            suspicious_clients_sorted = sorted(
+                [(cid, rep) for cid, rep in final_reputations.items() if rep > 0],
+                key=lambda item: item[1],
+                reverse=True
+            )
 
-    if history_under_attack:
-        rounds = len(history_under_attack['loss'])
-        max_rounds_loss = max(max_rounds_loss, rounds)
-        # 注意：这里的数据源改为了 history_under_attack['loss']
-        plt.plot(range(1, rounds + 1), history_under_attack['loss'], 'r-x',
-                 label=f'Under Attack (Ran for {rounds} rounds)')
-
-    if history_with_defense:
-        rounds = len(history_with_defense['loss'])
-        max_rounds_loss = max(max_rounds_loss, rounds)
-        # 注意：这里的数据源改为了 history_with_defense['loss']
-        plt.plot(range(1, rounds + 1), history_with_defense['loss'], 'b-o',
-                 label=f'With IDA Defense (Converged in {rounds} rounds)')
-
-    # 只有在至少绘制了一条线时才显示图表
-    if max_rounds_loss > 0:
-        # 修改图表的标题和Y轴标签
-        plt.title("Performance Comparison of IDA Online Defense (Loss)")
-        plt.xlabel("Federated Learning Round")
-        plt.ylabel("Global Model Test Loss")
-        plt.legend()
-        plt.grid(True)
-        # 设置Y轴下限为0，让matplotlib自动适应上限
-        plt.ylim(bottom=0)
-        plt.xlim(0, max_rounds_loss + 5)
-        plt.show()
-
+            print("最终声誉分 > 0 的客户端 (从高到低):")
+            if not suspicious_clients_sorted:
+                print("    没有任何客户端的最终声誉分 > 0。")
+            else:
+                for cid, rep in suspicious_clients_sorted:
+                    is_malicious_str = "恶意" if cid < config_with_defense["MALICIOUS_CLIENTS"] else "良性"
+                    print(f"    客户端 {cid} ({is_malicious_str}): 声誉分 = {rep}")
 
 
 
