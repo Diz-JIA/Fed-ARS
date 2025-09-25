@@ -6,7 +6,12 @@
 @Description: IDA+余弦相似度+基于声誉分的指数衰减权重
             没有wandb版本
 @History :
-
+- 2025/09/25, dizjia:
+  - 经过反复实验发现 ida 和余弦相似度误判率非常高，无法抵抗隐蔽后门攻击
+- 2025/09/22, v1.3, dizjia:
+    - 在 IDA 之后余弦相似度分析之前使用梯度裁剪
+    - 保留了巨大幅度让 IDA 发现异常
+    - 避免恶意更新通过大幅度来主导相似度分析的平均向量
 - 2025/09/21, v1.2, dizjia:
   - 添加了ASR指标
 - 2025/09/19, v1.1, dizjia:
@@ -33,10 +38,10 @@ import argparse
 config = {
     # 实验环境设置
     "DEVICE": torch.device("cuda" if torch.cuda.is_available() else "mps"),
-    "SEED": 42,
+    "SEED": 123,
 
     # 实验日志文件路径
-    "LOG_FILE_PATH": "./log/ic_decay_simulation/scene2.csv",
+    "LOG_FILE_PATH": "./log/ic_decay_simulation/scene3.csv",
 
     # 联邦学习设置
     "NUM_CLIENTS": 20,  # 增加客户端总数以更好地模拟统计检测
@@ -49,9 +54,9 @@ config = {
     "LEARNING_RATE": 0.01,
 
     # 攻击设置 (当前为后门攻击)
-    "ATTACK_TYPE": "backdoor",
-    "MALICIOUS_CLIENTS": 10,
-    "POISON_RATIO": 1,
+    "ATTACK_TYPE": "label_flipping",
+    "MALICIOUS_CLIENTS": 8,
+    "POISON_RATIO": 0.7,
     "BACKDOOR_TRIGGER_SIZE": 5,
     "BACKDOOR_TARGET_LABEL": 0,
 
@@ -59,14 +64,16 @@ config = {
     "DEFENSE_ENABLED": True,  # 是否启用在线防御
     "DEFENSE_START_ROUND": 5,  # 从第5轮开始执行防御，给模型一点初始收敛时间
 
-    # IDA+余弦相似度模块参数
+    # IDA+余弦相似度+范数裁剪模块参数
     "PERTURBATION_STRENGTH": 0.1,  # 扰动强度
-    "OUTLIER_THRESHOLD": 3.0,  # 判断异常的阈值（超过中位数3个MAD）
-    "SIMILARITY_THRESHOLD" :0.2,    #相似度阈值
+    "OUTLIER_THRESHOLD": 2.0,  # 判断异常的阈值（超过中位数3个MAD）
+    "SIMILARITY_THRESHOLD" :0.5,    #相似度阈值，越大则要求与主流方向越相近
+    "CLIP_MAX_NORM":1.2,  #裁剪阈值
+
     # 声誉与降权模块参数
     "REPUTATION_THRESHOLD": 3,  # 声誉分累计超过3次则被移除
     "REPUTATION_DECAY_FACTOR": 0.8, # γ值 (gamma)
-    "SUSPICIOUS_CLIENT_WEIGHT": 0.2, # 可疑客户端在聚合中的权重
+
 
     # 学习率调度器 (Scheduler) 设置
     "SCHEDULER_ENABLED": True,
@@ -183,8 +190,8 @@ class BackdoorDataset(Dataset):
             # 我们将触发器放在右下角
             # img 的形状是 (C, H, W)，例如 (3, 32, 32)
             c, h, w = img.shape
-            # 将右下角的一个 trigger_size x trigger_size 的区域像素值设为最大值 (白色)
-            img[:, h - self.trigger_size:, w - self.trigger_size:] = 1.0
+            # 将右下角的一个 trigger_size x trigger_size 的区域像素值设为最大（白色）
+            img[:, h - self.trigger_size:, w - self.trigger_size:] = 1
 
         return img, label
 
@@ -212,7 +219,7 @@ def evaluate_backdoor_asr(model, test_loader, device, config):
 
             # 在图片上粘贴触发器
             c, h, w = data.shape[1:]
-            data[:, :, h - trigger_size:, w - trigger_size:] = 1.0
+            data[:, :, h - trigger_size:, w - trigger_size:] = 1
 
             # 进行预测
             outputs = model(data)
@@ -333,7 +340,19 @@ def calculate_instability_score(model_state_dict, probe_images, device, config):
 
     return np.mean(scores)
 
-
+def clip_update_norm_(update, max_norm):
+    """
+    对单个客户端的更新字典 (update) 进行原地范数裁剪。
+    Args:
+        update (dict): 客户端模型更新的 state_dict。
+        max_norm (float): 范数上限。
+    """
+    flat_update = torch.cat([p.flatten() for p in update.values()])
+    norm = torch.norm(flat_update, p=2)  # p=2指明使用L2范数
+    if norm > max_norm:
+        clip_coef = max_norm / (norm + 1e-6)
+        for param in update.values():
+            param.mul_(clip_coef)
 
 class Server:
     def __init__(self, all_clients, test_loader, config):
@@ -354,6 +373,8 @@ class Server:
         self.active_clients_pool = list(all_clients)
         self.reputation_scores = {client.client_id: 0 for client in all_clients}
 
+        # --- [新增] 创建一个恶意ID集合，方便快速查询 ---
+        self.malicious_ids = {c.client_id for c in all_clients if c.is_malicious}
 
         # 探测器图片生成
         self.probe_images = self._generate_probes()
@@ -405,6 +426,10 @@ class Server:
 
     def run_simulation(self):
         """运行完整的联邦学习模拟过程 (v3.3 - 永久声誉 + 指数衰减权重)"""
+        # --- [新增] 用于收集范数的列表 ---
+        benign_norms = []
+        malicious_norms = []
+
         try:
             for t in range(self.config["FL_ROUNDS"]):
                 print(f"\n--- 第 {t + 1}/{self.config['FL_ROUNDS']} 轮 ---")
@@ -413,11 +438,8 @@ class Server:
                 selected_clients = random.sample(self.active_clients_pool, num_to_select)
 
                 # --- [新增代码] 打印本轮选中的恶意客户端ID ---
-                # 检查当前是否为场景二 (有攻击 & 无防御)
-                is_attack_no_defense_scenario = self.config.get("MALICIOUS_CLIENTS", 0) > 0 and \
-                                                not self.config.get("DEFENSE_ENABLED", False)
-
-                if is_attack_no_defense_scenario:
+                # 检查当前是否为场景二或三
+                if self.config.get("MALICIOUS_CLIENTS", 0) > 0:
                     # 从选中的客户端中筛选出恶意的，并记录他们的ID
                     selected_malicious_ids = sorted([
                         client.client_id for client in selected_clients if client.is_malicious
@@ -433,9 +455,20 @@ class Server:
                     update = client.train(copy.deepcopy(global_model_state_dict), learning_rate=current_lr)
                     client_updates[client.client_id] = update
 
+                # --- [新增] 在防御逻辑开始前，计算并收集范数 ---
+                for client_id, update in client_updates.items():
+                    flat_update = torch.cat([p.flatten() for p in update.values()])
+                    norm = torch.norm(flat_update, p=2).item()  # .item() 将tensor转为数字
+
+                    if client_id in self.malicious_ids:
+                        malicious_norms.append(norm)
+                    else:
+                        benign_norms.append(norm)
+
                 if self.config["DEFENSE_ENABLED"] and t + 1 >= self.config["DEFENSE_START_ROUND"]:
-                    suspicious_ids = []  # 首先初始化一个空的可疑列表
+
                     # --- 1. 计算不稳定增量 (IDA部分) ---
+                    ida_suspicious_ids = []
                     score_base = calculate_instability_score(
                         global_model_state_dict, self.probe_images, self.device, self.config
                     )
@@ -449,60 +482,71 @@ class Server:
                         )
                         deltas[client_id] = score_temp - score_base
 
-                    # --- 2. 计算更新方向相似度 (交叉验证部分) ---
-                    similarities = {}
-                    if len(client_updates) > 1:
+                    delta_values = list(deltas.values())
+                    if len(delta_values) > 1:
+                        median_delta = np.median(delta_values)
+                        mad_delta = np.median(np.abs(delta_values - median_delta))
+                        if mad_delta == 0: mad_delta = 1e-9
+
+                        for client_id, delta in deltas.items():
+                            score_mad = (delta - median_delta) / mad_delta
+                            # IDA 标记的是得分“过高”的异常值
+                            if score_mad > self.config["OUTLIER_THRESHOLD"]:
+                                ida_suspicious_ids.append(client_id)
+
+                    print(f"    [调试-IDA] 检测到的可疑客户端: {sorted(ida_suspicious_ids)}")
+
+                    # --- 2. [新增] 在相似度分析前，进行梯度裁剪 ---
+                    CLIP_MAX_NORM = config["CLIP_MAX_NORM"] # 这是一个超参数，您可以按需调整
+                    # 注意：我们克隆一份用于裁剪，以防未来需要原始更新
+                    clipped_updates = copy.deepcopy(client_updates)
+                    for client_id in clipped_updates.keys():
+                        clip_update_norm_(clipped_updates[client_id], CLIP_MAX_NORM)
+                    # print(f"    [防御流程] 已对更新执行范数裁剪 (上限={CLIP_MAX_NORM})，用于后续分析。")
+
+                    # --- 3. 更新方向相似度 (对裁剪后的更新进行) ---
+                    similarity_suspicious_ids = []
+                    if len(clipped_updates) > 1:
+                        # 计算裁剪后更新的平均方向
                         all_updates_flat = torch.stack([
                             torch.cat([p.flatten() for p in update.values()])
-                            for update in client_updates.values()
+                            for update in clipped_updates.values()
                         ])
-                        # 使用坐标平均数来定义主流方向
                         avg_update_flat = torch.mean(all_updates_flat, dim=0)
 
-                        for client_id, update in client_updates.items():
+                        for client_id, update in clipped_updates.items():
                             update_flat = torch.cat([p.flatten() for p in update.values()])
                             cos = nn.CosineSimilarity(dim=0, eps=1e-6)
                             similarity = cos(update_flat, avg_update_flat).item()
-                            similarities[client_id] = similarity
 
-                    # --- 3.混合判断逻辑，识别本轮的“可疑分子” ---
-                    delta_values = list(deltas.values())
-                    if len(delta_values) > 1:
-                        median = np.median(delta_values)
-                        mad = np.median([np.abs(v - median) for v in delta_values])
-                        if mad == 0: mad = 1e-9
+                            # 如果相似度低于阈值，则可疑
+                            if similarity < self.config["SIMILARITY_THRESHOLD"]:
+                                similarity_suspicious_ids.append(client_id)
 
-                        SIMILARITY_THRESHOLD = self.config.get("SIMILARITY_THRESHOLD", 0.0)
+                    print(f"    [调试-余弦相似度] 检测到的可疑客户端: {sorted(similarity_suspicious_ids)}")
 
-                        for client_id, delta in deltas.items():
-                            score_mad = (delta - median) / mad
-                            similarity_score = similarities.get(client_id, 1.0)
-                            # 这里需要测试用 or和 and哪个效果更好
-                            if score_mad > self.config["OUTLIER_THRESHOLD"] or similarity_score < SIMILARITY_THRESHOLD:
-                                suspicious_ids.append(client_id)
+                    # --- 4.混合判断逻辑，识别本轮的“可疑分子” ---
+                    suspicious_ids = sorted(list(set(ida_suspicious_ids) | set(similarity_suspicious_ids)))
 
                     if suspicious_ids:
-                        print(f"    [侦测模块] 本轮检测到可疑客户端: {suspicious_ids}")
+                        print(f"    [侦测模块] 本轮最终可疑客户端: {suspicious_ids}")
 
-                    # --- 4. [核心修改] 更新永久声誉分 (只增不减) ---
+                    # --- 5. 更新永久声誉分 ---
                     for client_id in suspicious_ids:
                         self.reputation_scores[client_id] += 1
 
                     # print(f"    [声誉模块] 当前所有客户端声誉分: {self.reputation_scores}")
 
-                    # --- 5. [核心修改] 模型加权聚合 (基于“指数衰减”) ---
+                    # --- 6. 模型基于指数衰减加权聚合 (修改：使用裁剪后的更新) ---
                     decay_factor = self.config["REPUTATION_DECAY_FACTOR"]
                     weights = {cid: decay_factor ** self.reputation_scores.get(cid, 0)
-                               for cid in client_updates.keys()}
+                               for cid in clipped_updates.keys()}
 
-                    # print(f"    本轮聚合权重: {weights}")
-
-                    # (加权平均的计算逻辑保持不变)
                     sum_of_weights = sum(weights.values())
                     avg_update = {}
-                    for key in client_updates[list(client_updates.keys())[0]].keys():
+                    for key in clipped_updates[list(clipped_updates.keys())[0]].keys():
                         weighted_sum_layer = torch.stack(
-                            [client_updates[cid][key] * weights[cid] for cid in client_updates.keys()],
+                            [clipped_updates[cid][key] * weights[cid] for cid in clipped_updates.keys()],
                             dim=0
                         ).sum(dim=0)
                         avg_update[key] = weighted_sum_layer / sum_of_weights
@@ -569,6 +613,20 @@ class Server:
         torch.save(self.global_model.state_dict(), save_path)
         # print(f"当前场景的最终模型已保存至: {save_path}")
 
+        # --- [新增] 在模拟结束后，打印统计数据 ---
+        print("\n--- 范数侦察统计 ---")
+        if benign_norms:
+            print(f"良性更新范数 (Benign Norms) - 共 {len(benign_norms)} 个样本:")
+            print(f"  - 均值 (Mean): {np.mean(benign_norms):.4f}")
+            print(f"  - 中位数 (Median): {np.median(benign_norms):.4f}")
+            print(f"  - 95百分位 (95th percentile): {np.percentile(benign_norms, 95):.4f}")
+            print(f"  - 最大值 (Max): {np.max(benign_norms):.4f}")
+        if malicious_norms:
+            print(f"恶意更新范数 (Malicious Norms) - 共 {len(malicious_norms)} 个样本:")
+            print(f"  - 均值 (Mean): {np.mean(malicious_norms):.4f}")
+            print(f"  - 中位数 (Median): {np.median(malicious_norms):.4f}")
+            print(f"  - 最小值 (Min): {np.min(malicious_norms):.4f}")
+
         return self.history
 
 
@@ -622,10 +680,11 @@ if __name__ == "__main__":
         server_no_attack = Server(clients_no_attack, test_loader, config_no_attack)
         history_no_attack = server_no_attack.run_simulation()
 
-        # [新增] 计算最终的ASR
-        final_asr = evaluate_backdoor_asr(server_no_attack.global_model, test_loader, config["DEVICE"],
-                                          config_no_attack)
-        print(f"    [评估] 最终攻击成功率 (ASR): {final_asr:.2f}%")
+        if config["ATTACK_TYPE"] == "backdoor":
+            # [新增] 计算最终的ASR
+            final_asr = evaluate_backdoor_asr(server_no_attack.global_model, test_loader, config["DEVICE"],
+                                              config_no_attack)
+            print(f"    [评估] 最终攻击成功率 (ASR): {final_asr:.2f}%")
 
         ### 修改 ###: 复用通用参数，并添加场景特定参数
         params_log_1 = common_params_to_log.copy()
@@ -668,10 +727,11 @@ if __name__ == "__main__":
         server_under_attack = Server(clients_under_attack, test_loader, config_under_attack)
         history_under_attack = server_under_attack.run_simulation()
 
-        # [新增] 计算最终的ASR
-        final_asr = evaluate_backdoor_asr(server_under_attack.global_model, test_loader, config["DEVICE"],
-                                          config_under_attack)
-        print(f"    [评估] 最终攻击成功率 (ASR): {final_asr:.2f}%")
+        if config["ATTACK_TYPE"] == "backdoor":
+            # [新增] 计算最终的ASR
+            final_asr = evaluate_backdoor_asr(server_under_attack.global_model, test_loader, config["DEVICE"],
+                                              config_under_attack)
+            print(f"    [评估] 最终攻击成功率 (ASR): {final_asr:.2f}%")
 
         ### 修改 ###: 复用通用参数，并添加场景特定参数
         params_log_2 = common_params_to_log.copy()
@@ -713,10 +773,11 @@ if __name__ == "__main__":
         server_with_defense = Server(clients_with_defense, test_loader, config_with_defense)
         history_with_defense = server_with_defense.run_simulation()
 
-        # [新增] 计算最终的ASR
-        final_asr = evaluate_backdoor_asr(server_with_defense.global_model, test_loader, config["DEVICE"],
-                                          config_with_defense)
-        print(f"    [评估] 最终攻击成功率 (ASR): {final_asr:.2f}%")
+        if config["ATTACK_TYPE"] == "backdoor":
+            # [新增] 计算最终的ASR
+            final_asr = evaluate_backdoor_asr(server_with_defense.global_model, test_loader, config["DEVICE"],
+                                              config_with_defense)
+            print(f"    [评估] 最终攻击成功率 (ASR): {final_asr:.2f}%")
 
         ### 修改 ###: 复用通用参数，并添加场景特定参数
         params_log_3 = common_params_to_log.copy()
@@ -750,96 +811,98 @@ if __name__ == "__main__":
 
     # print(f"\n[日志] 所有场景已成功记录到: {config['LOG_FILE_PATH']}")
 
-        # --- 4. 结果可视化 ---
-        # [修改] 将两个图的绘制逻辑分得更清晰
+    if history_with_defense:
+        print("\n--- 防御效果总结 ---")
+        final_reputations = server_with_defense.reputation_scores
+        suspicious_clients_sorted = sorted(
+            [(cid, rep) for cid, rep in final_reputations.items() if rep > 0],
+            key=lambda item: item[1],
+            reverse=True
+        )
 
-        # --- 图表一：准确率对比 ---
-        plt.figure(figsize=(10, 6))
-        max_rounds_acc = 0
-
-        if history_no_attack:
-            rounds = len(history_no_attack['accuracy'])
-            max_rounds_acc = max(max_rounds_acc, rounds)
-            plt.plot(range(1, rounds + 1), history_no_attack['accuracy'], 'g-s',
-                     label=f'No Attack (Converged in {rounds} rounds)')
-
-        if history_under_attack:
-            rounds = len(history_under_attack['accuracy'])
-            max_rounds_acc = max(max_rounds_acc, rounds)
-            plt.plot(range(1, rounds + 1), history_under_attack['accuracy'], 'r-x',
-                     label=f'Under Attack (Ran for {rounds} rounds)')
-
-        # [修正] 补上缺失的 "With Defense" 准确率曲线
-        if history_with_defense:
-            rounds = len(history_with_defense['accuracy'])
-            max_rounds_acc = max(max_rounds_acc, rounds)
-            plt.plot(range(1, rounds + 1), history_with_defense['accuracy'], 'b-o',
-                     label=f'With IDA Defense (Converged in {rounds} rounds)')
-
-        if max_rounds_acc > 0:
-            plt.title("Performance Comparison of IDA Online Defense (Accuracy)")
-            plt.xlabel("Federated Learning Round")
-            plt.ylabel("Global Model Test Accuracy")
-            plt.legend()
-            plt.grid(True)
-            plt.ylim(0, 1)
-            plt.xlim(0, max_rounds_acc + 5)
-            plt.show()
+        print("最终声誉分 > 0 的客户端 (从高到低):")
+        if not suspicious_clients_sorted:
+            print("    没有任何客户端的最终声誉分 > 0。")
         else:
-            # 如果一个场景都没跑，就打印提示
-            print("\n[可视化] 未运行任何场景，无法绘制准确率图。")
+            for cid, rep in suspicious_clients_sorted:
+                is_malicious_str = "恶意" if cid < config_with_defense["MALICIOUS_CLIENTS"] else "良性"
+                print(f"    客户端 {cid} ({is_malicious_str}): 声誉分 = {rep}")
 
-        # --- 图表二：损失值对比 ---
-        plt.figure(figsize=(12, 7))
-        max_rounds_loss = 0
 
-        if history_no_attack:
-            rounds = len(history_no_attack['loss'])
-            max_rounds_loss = max(max_rounds_loss, rounds)
-            plt.plot(range(1, rounds + 1), history_no_attack['loss'], 'g-s',
-                     label=f'No Attack (Converged in {rounds} rounds)')
+    # --- 4. 结果可视化 ---
+    # [修改] 将两个图的绘制逻辑分得更清晰
 
-        if history_under_attack:
-            rounds = len(history_under_attack['loss'])
-            max_rounds_loss = max(max_rounds_loss, rounds)
-            plt.plot(range(1, rounds + 1), history_under_attack['loss'], 'r-x',
-                     label=f'Under Attack (Ran for {rounds} rounds)')
+    # --- 图表一：准确率对比 ---
+    plt.figure(figsize=(10, 6))
+    max_rounds_acc = 0
 
-        if history_with_defense:
-            rounds = len(history_with_defense['loss'])
-            max_rounds_loss = max(max_rounds_loss, rounds)
-            plt.plot(range(1, rounds + 1), history_with_defense['loss'], 'b-o',
-                     label=f'With IDA Defense (Converged in {rounds} rounds)')
+    if history_no_attack:
+        rounds = len(history_no_attack['accuracy'])
+        max_rounds_acc = max(max_rounds_acc, rounds)
+        plt.plot(range(1, rounds + 1), history_no_attack['accuracy'], 'g-s',
+                 label=f'No Attack (Converged in {rounds} rounds)')
 
-        if max_rounds_loss > 0:
-            plt.title("Performance Comparison of IDA Online Defense (Loss)")
-            plt.xlabel("Federated Learning Round")
-            plt.ylabel("Global Model Test Loss")
-            plt.legend()
-            plt.grid(True)
-            plt.ylim(bottom=0)
-            plt.xlim(0, max_rounds_loss + 5)
-            plt.show()
-        else:
-            print("\n[可视化] 未运行任何场景，无法绘制损失图。")
+    if history_under_attack:
+        rounds = len(history_under_attack['accuracy'])
+        max_rounds_acc = max(max_rounds_acc, rounds)
+        plt.plot(range(1, rounds + 1), history_under_attack['accuracy'], 'r-x',
+                 label=f'Under Attack (Ran for {rounds} rounds)')
 
-        # --- [修正] 将防御效果总结的打印逻辑移到所有绘图之后 ---
-        if history_with_defense:
-            print("\n--- 防御效果总结 ---")
-            final_reputations = server_with_defense.reputation_scores
-            suspicious_clients_sorted = sorted(
-                [(cid, rep) for cid, rep in final_reputations.items() if rep > 0],
-                key=lambda item: item[1],
-                reverse=True
-            )
+    # [修正] 补上缺失的 "With Defense" 准确率曲线
+    if history_with_defense:
+        rounds = len(history_with_defense['accuracy'])
+        max_rounds_acc = max(max_rounds_acc, rounds)
+        plt.plot(range(1, rounds + 1), history_with_defense['accuracy'], 'b-o',
+                 label=f'With IDA Defense (Converged in {rounds} rounds)')
 
-            print("最终声誉分 > 0 的客户端 (从高到低):")
-            if not suspicious_clients_sorted:
-                print("    没有任何客户端的最终声誉分 > 0。")
-            else:
-                for cid, rep in suspicious_clients_sorted:
-                    is_malicious_str = "恶意" if cid < config_with_defense["MALICIOUS_CLIENTS"] else "良性"
-                    print(f"    客户端 {cid} ({is_malicious_str}): 声誉分 = {rep}")
+    if max_rounds_acc > 0:
+        plt.title("Performance Comparison of IDA Online Defense (Accuracy)")
+        plt.xlabel("Federated Learning Round")
+        plt.ylabel("Global Model Test Accuracy")
+        plt.legend()
+        plt.grid(True)
+        plt.ylim(0, 1)
+        plt.xlim(0, max_rounds_acc + 5)
+        plt.show()
+    else:
+        # 如果一个场景都没跑，就打印提示
+        print("\n[可视化] 未运行任何场景，无法绘制准确率图。")
+
+    # --- 图表二：损失值对比 ---
+    plt.figure(figsize=(12, 7))
+    max_rounds_loss = 0
+
+    if history_no_attack:
+        rounds = len(history_no_attack['loss'])
+        max_rounds_loss = max(max_rounds_loss, rounds)
+        plt.plot(range(1, rounds + 1), history_no_attack['loss'], 'g-s',
+                 label=f'No Attack (Converged in {rounds} rounds)')
+
+    if history_under_attack:
+        rounds = len(history_under_attack['loss'])
+        max_rounds_loss = max(max_rounds_loss, rounds)
+        plt.plot(range(1, rounds + 1), history_under_attack['loss'], 'r-x',
+                 label=f'Under Attack (Ran for {rounds} rounds)')
+
+    if history_with_defense:
+        rounds = len(history_with_defense['loss'])
+        max_rounds_loss = max(max_rounds_loss, rounds)
+        plt.plot(range(1, rounds + 1), history_with_defense['loss'], 'b-o',
+                 label=f'With IDA Defense (Converged in {rounds} rounds)')
+
+    if max_rounds_loss > 0:
+        plt.title("Performance Comparison of IDA Online Defense (Loss)")
+        plt.xlabel("Federated Learning Round")
+        plt.ylabel("Global Model Test Loss")
+        plt.legend()
+        plt.grid(True)
+        plt.ylim(bottom=0)
+        plt.xlim(0, max_rounds_loss + 5)
+        plt.show()
+    else:
+        print("\n[可视化] 未运行任何场景，无法绘制损失图。")
+
+
 
 
 
