@@ -3,10 +3,12 @@
 @File    : ttr.py
 @Time    : 2025/9/25
 @Author  : dizjia
-@Description: IDA+成对余弦相似度+基于声誉分的指数衰减权重
+@Description: 成对余弦相似度+IDA双重审查
             没有wandb版本
 @History :
-
+- 2025/9/25, v1.1：
+    - 成对余弦相似度+IDA双重审查
+    - 在后门攻击场景下效果依然很差
 """
 
 
@@ -51,7 +53,7 @@ config = {
     "BACKDOOR_TRIGGER_SIZE": 5,
     "BACKDOOR_TARGET_LABEL": 0,
 
-    # 防御设置 (核心)
+    # 防御设置
     "DEFENSE_ENABLED": True,  # 是否启用在线防御
     "DEFENSE_START_ROUND": 5,  # 从第5轮开始执行防御，给模型一点初始收敛时间
 
@@ -689,11 +691,11 @@ if __name__ == "__main__":
         server_no_attack = Server(clients_no_attack, test_loader, config_no_attack)
         history_no_attack = server_no_attack.run_simulation()
 
-        if config["ATTACK_TYPE"] == "backdoor":
-            # [新增] 计算最终的ASR
-            final_asr = evaluate_backdoor_asr(server_no_attack.global_model, test_loader, config["DEVICE"],
-                                              config_no_attack)
-            print(f"    [评估] 最终攻击成功率 (ASR): {final_asr:.2f}%")
+
+        # [新增] 计算最终的ASR
+        final_asr = evaluate_backdoor_asr(server_no_attack.global_model, test_loader, config["DEVICE"],
+                                          config_no_attack)
+        print(f"    [评估] 最终攻击成功率 (ASR): {final_asr:.2f}%")
 
         ### 修改 ###: 复用通用参数，并添加场景特定参数
         params_log_1 = common_params_to_log.copy()
@@ -736,11 +738,11 @@ if __name__ == "__main__":
         server_under_attack = Server(clients_under_attack, test_loader, config_under_attack)
         history_under_attack = server_under_attack.run_simulation()
 
-        if config["ATTACK_TYPE"] == "backdoor":
-            # [新增] 计算最终的ASR
-            final_asr = evaluate_backdoor_asr(server_under_attack.global_model, test_loader, config["DEVICE"],
-                                              config_under_attack)
-            print(f"    [评估] 最终攻击成功率 (ASR): {final_asr:.2f}%")
+
+        # [新增] 计算最终的ASR
+        final_asr = evaluate_backdoor_asr(server_under_attack.global_model, test_loader, config["DEVICE"],
+                                          config_under_attack)
+        print(f"    [评估] 最终攻击成功率 (ASR): {final_asr:.2f}%")
 
         ### 修改 ###: 复用通用参数，并添加场景特定参数
         params_log_2 = common_params_to_log.copy()
@@ -782,11 +784,11 @@ if __name__ == "__main__":
         server_with_defense = Server(clients_with_defense, test_loader, config_with_defense)
         history_with_defense = server_with_defense.run_simulation()
 
-        if config["ATTACK_TYPE"] == "backdoor":
-            # [新增] 计算最终的ASR
-            final_asr = evaluate_backdoor_asr(server_with_defense.global_model, test_loader, config["DEVICE"],
-                                              config_with_defense)
-            print(f"    [评估] 最终攻击成功率 (ASR): {final_asr:.2f}%")
+
+        # [新增] 计算最终的ASR
+        final_asr = evaluate_backdoor_asr(server_with_defense.global_model, test_loader, config["DEVICE"],
+                                          config_with_defense)
+        print(f"    [评估] 最终攻击成功率 (ASR): {final_asr:.2f}%")
 
         ### 修改 ###: 复用通用参数，并添加场景特定参数
         params_log_3 = common_params_to_log.copy()
