@@ -6,6 +6,8 @@
 @Description: 成对余弦相似度+IDA双重审查
             没有wandb版本
 @History :
+- 2025/9/25, v1.2：
+    - 将IDA反转使用，成对余弦相似度保留
 - 2025/9/25, v1.1：
     - 成对余弦相似度+IDA双重审查
     - 在后门攻击场景下效果依然很差
@@ -59,13 +61,13 @@ config = {
 
     # 双重审查模型参数
     "PERTURBATION_STRENGTH": 0.1,  # 扰动强度
-    "SIMILARITY_MAD_THRESHOLD": 2.5, # 第一级(相似度)审查阈值，越小越宽松
-    "IDA_MAD_THRESHOLD": 3.0,        # 第二级(IDA)审查阈值，用于捕获极端异常，应设得较高
+    "SIMILARITY_LOW_MAD_THRESHOLD": 2.0, # 相似度声望分的“低分”阈值 (越小越宽松)
+    "IDA_LOW_MAD_THRESHOLD": 2.0,         # IDA不稳定性增量的“低分”阈值 (越小越宽松)
 
     "CLIP_MAX_NORM":1.2,  #裁剪阈值
 
     # 声誉与降权模块参数
-    "REPUTATION_THRESHOLD": 3,  # 声誉分累计超过3次则被移除
+
     "REPUTATION_DECAY_FACTOR": 0.8, # γ值 (gamma)
 
 
@@ -472,10 +474,9 @@ class Server:
                     client_ids = list(clipped_updates.keys())
                     num_clients_in_round = len(client_ids)
 
-                    # --- Part 1: 第一级审查 (基于两两相似度的主要嫌疑犯筛选) ---
-                    similarity_suspects = []
+                    # --- Part 1: 行为异常检测 (基于两两相似度) ---
+                    behavioral_suspects = []
                     if num_clients_in_round > 1:
-                        # 1.1 计算相似度矩阵和“声望分”
                         updates_flat = {cid: torch.cat([p.flatten() for p in upd.values()]) for cid, upd in
                                         clipped_updates.items()}
                         similarity_matrix = np.ones((num_clients_in_round, num_clients_in_round))
@@ -486,73 +487,56 @@ class Server:
                                 similarity = cos(updates_flat[client_i_id], updates_flat[client_j_id]).item()
                                 similarity_matrix[i, j] = similarity
                                 similarity_matrix[j, i] = similarity
-
                         reputation_scores_round = np.sum(similarity_matrix, axis=1)
 
-                        # 1.2 使用MAD检测声望分中的“异常低值”
                         median_rep = np.median(reputation_scores_round)
                         mad_rep = np.median(np.abs(reputation_scores_round - median_rep))
                         if mad_rep == 0: mad_rep = 1e-9
 
-                        score_threshold = self.config["SIMILARITY_MAD_THRESHOLD"]
+                        score_threshold_sim = self.config["SIMILARITY_LOW_MAD_THRESHOLD"]
                         for i in range(num_clients_in_round):
-                            client_id = client_ids[i]
                             score = reputation_scores_round[i]
                             z_score = (score - median_rep) / mad_rep
-                            if z_score < -score_threshold:
-                                similarity_suspects.append(client_id)
+                            if z_score < -score_threshold_sim:
+                                behavioral_suspects.append(client_ids[i])
 
-                    print(f"    [调试-相似度 Tier 1] 检测到主要嫌疑: {sorted(similarity_suspects)}")
+                    print(f"    [调试-行为] 检测到低相似度嫌疑: {sorted(behavioral_suspects)}")
 
-                    # --- Part 2: 第二级审查 (基于IDA的极端异常复核) ---
-                    ida_suspects = []
-                    # 2.1 找出未被第一级标记的客户端，作为IDA的审查对象
-                    clients_for_ida_review = [cid for cid in client_ids if cid not in similarity_suspects]
+                    # --- Part 2: 后果异常检测 (基于“反转”的IDA) ---
+                    consequential_suspects = []
+                    score_base = calculate_instability_score(global_model_state_dict, self.probe_images, self.device,
+                                                             self.config)
+                    deltas = {cid: calculate_instability_score({k: global_model_state_dict[k] + u[k] for k in u},
+                                                               self.probe_images, self.device, self.config) - score_base
+                              for cid, u in client_updates.items()}
 
-                    if len(clients_for_ida_review) > 1:
-                        # 2.2 对这些客户端运行IDA分析
-                        score_base = calculate_instability_score(global_model_state_dict, self.probe_images,
-                                                                 self.device, self.config)
-                        deltas = {}
-                        for client_id in clients_for_ida_review:
-                            update = client_updates[client_id]  # 在原始更新上运行IDA
-                            temp_model_state_dict = {key: global_model_state_dict[key] + update[key] for key in
-                                                     global_model_state_dict}
-                            score_temp = calculate_instability_score(temp_model_state_dict, self.probe_images,
-                                                                     self.device, self.config)
-                            deltas[client_id] = score_temp - score_base
-
-                        # 2.3 使用一个更严格的阈值来检测极端异常
-                        delta_values = list(deltas.values())
+                    delta_values = list(deltas.values())
+                    if len(delta_values) > 1:
                         median_delta = np.median(delta_values)
                         mad_delta = np.median(np.abs(delta_values - median_delta))
                         if mad_delta == 0: mad_delta = 1e-9
 
-                        score_threshold_ida = self.config["IDA_MAD_THRESHOLD"]
+                        score_threshold_ida = self.config["IDA_LOW_MAD_THRESHOLD"]
                         for client_id, delta in deltas.items():
                             score_mad = (delta - median_delta) / mad_delta
-                            if score_mad > score_threshold_ida:
-                                ida_suspects.append(client_id)
+                            if score_mad < -score_threshold_ida:
+                                consequential_suspects.append(client_id)
 
-                    print(f"    [调试-IDA Tier 2] 复核发现极端异常: {sorted(ida_suspects)}")
+                    print(f"    [调试-后果] 检测到低稳定性嫌疑: {sorted(consequential_suspects)}")
 
-                    # --- Part 3: 合并结果并更新声誉 ---
-                    suspicious_ids = sorted(list(set(similarity_suspects) | set(ida_suspects)))
+                    # --- Part 3: 取交集，最终裁决 (AND Logic) ---
+                    suspicious_ids = sorted(list(set(behavioral_suspects) & set(consequential_suspects)))
 
                     if suspicious_ids:
                         print(f"    [侦测模块] 本轮最终可疑客户端: {suspicious_ids}")
 
-                    # --- 4. 更新永久声誉分 ---
+                    # 后续的声誉累积和加权聚合逻辑保持不变
                     for client_id in suspicious_ids:
                         self.reputation_scores[client_id] += 1
 
-                    # print(f"    [声誉模块] 当前所有客户端声誉分: {self.reputation_scores}")
-
-                    # --- 5. 模型基于指数衰减加权聚合 (修改：使用裁剪后的更新) ---
                     decay_factor = self.config["REPUTATION_DECAY_FACTOR"]
-                    weights = {cid: decay_factor ** self.reputation_scores.get(cid, 0)
-                               for cid in clipped_updates.keys()}
-
+                    weights = {cid: decay_factor ** self.reputation_scores.get(cid, 0) for cid in
+                               clipped_updates.keys()}
                     sum_of_weights = sum(weights.values())
                     avg_update = {}
                     for key in clipped_updates[list(clipped_updates.keys())[0]].keys():
@@ -561,7 +545,6 @@ class Server:
                             dim=0
                         ).sum(dim=0)
                         avg_update[key] = weighted_sum_layer / sum_of_weights
-
                 else:  # 如果不启用防御，则走标准FedAvg
                     updates_to_aggregate = client_updates
                     if updates_to_aggregate:
@@ -704,9 +687,9 @@ if __name__ == "__main__":
             "MALICIOUS_CLIENTS":"N/A",
             "POISON_RATIO": "N/A",
             "PERTURBATION_STRENGTH": "N/A",
-            "SIMILARITY_MAD_THRESHOLD": "N/A",
-            "IDA_MAD_THRESHOLD": "N/A",
-            "REPUTATION_THRESHOLD": "N/A",
+            "SIMILARITY_LOW_MAD_THRESHOLD": "N/A",
+            "IDA_LOW_MAD_THRESHOLD": "N/A",
+
             "REPUTATION_DECAY_FACTOR": "N/A"
         })
         actual_rounds_1 = len(history_no_attack['accuracy'])
@@ -750,9 +733,9 @@ if __name__ == "__main__":
             "MALICIOUS_CLIENTS": config["MALICIOUS_CLIENTS"],
             "POISON_RATIO": config["POISON_RATIO"],
             "PERTURBATION_STRENGTH": "N/A",
-            "SIMILARITY_MAD_THRESHOLD": "N/A",
-            "IDA_MAD_THRESHOLD": "N/A",
-            "REPUTATION_THRESHOLD": "N/A",
+            "SIMILARITY_LOW_MAD_THRESHOLD": "N/A",
+            "IDA_LOW_MAD_THRESHOLD": "N/A",
+
             "REPUTATION_DECAY_FACTOR": "N/A",
         })
         actual_rounds_2 = len(history_under_attack['accuracy'])
@@ -769,6 +752,7 @@ if __name__ == "__main__":
     if 3 in scenarios_to_run:
         # --- 场景三: 有攻击, 有您的IDA防御 ---
         print("\n\n=============== 场景三: 有攻击, 启用IDA防御 ===============")
+        print(f"    [攻击设置] {config["ATTACK_TYPE"]}")
 
         config_with_defense = copy.deepcopy(config)
         config_with_defense["DEFENSE_ENABLED"] = True
@@ -796,9 +780,9 @@ if __name__ == "__main__":
             "MALICIOUS_CLIENTS": config["MALICIOUS_CLIENTS"],
             "POISON_RATIO": config["POISON_RATIO"],
             "PERTURBATION_STRENGTH": config["PERTURBATION_STRENGTH"],
-            "SIMILARITY_MAD_THRESHOLD": config["SIMILARITY_MAD_THRESHOLD"],
-            "IDA_MAD_THRESHOLD": config.get("IDA_MAD_THRESHOLD", "N/A"),
-            "REPUTATION_THRESHOLD": config["REPUTATION_THRESHOLD"],
+            "SIMILARITY_LOW_MAD_THRESHOLD": config["SIMILARITY_LOW_MAD_THRESHOLD"],
+            "IDA_LOW_MAD_THRESHOLD": config.get("IDA_LOW_MAD_THRESHOLD", "N/A"),
+
             "REPUTATION_DECAY_FACTOR": config.get("REPUTATION_DECAY_FACTOR", "N/A")
         })
         actual_rounds_3 = len(history_with_defense['accuracy'])
