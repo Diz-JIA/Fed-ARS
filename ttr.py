@@ -6,6 +6,10 @@
 @Description: 成对余弦相似度+IDA双重审查
             没有wandb版本
 @History :
+- 2025/9/28, v1.5：
+    - 采用相对对抗性脆弱度
+- 2025/9/28, v1.4：
+    - ida替换为对抗性脆弱度，详见函数calculate_adversarial_vulnerability
 - 2025/9/26, v1.3：
     - 将IDA反转使用，成对余弦相似度替换为成对欧式距离
 - 2025/9/25, v1.2：
@@ -518,18 +522,6 @@ class Server:
                     client_ids = list(clipped_updates.keys())
                     num_clients_in_round = len(client_ids)
 
-                    #  打印IDA分数排名
-                    score_base = calculate_instability_score(global_model_state_dict, self.probe_images, self.device,
-                                                             self.config)
-                    deltas = {cid: calculate_instability_score({k: global_model_state_dict[k] + u[k] for k in u},
-                                                               self.probe_images, self.device, self.config) - score_base
-                              for cid, u in client_updates.items()}
-
-                    delta_list = sorted(list(deltas.items()), key=lambda item: item[1], reverse=True)
-                    print("    [调试-IDA分数排名] (Client ID, Score, Type):")
-                    for client_id, score in delta_list:
-                        client_type = "恶意" if client_id in self.malicious_ids else "良性"
-                        print(f"      - Client {client_id:<2} | Score: {score:8.4f} | Type: {client_type}")
 
                     # --- Part 1: 行为异常检测 (基于两两欧氏距离) ---
                     behavioral_suspects = []
@@ -537,61 +529,62 @@ class Server:
                         updates_flat = {cid: torch.cat([p.flatten() for p in upd.values()]) for cid, upd in
                                         clipped_updates.items()}
                         distance_matrix = np.zeros((num_clients_in_round, num_clients_in_round))
-
-                        # 1.1 [修改] 计算两两欧氏距离
                         for i in range(num_clients_in_round):
                             for j in range(i + 1, num_clients_in_round):
-                                client_i_id, client_j_id = client_ids[i], client_ids[j]
-                                # 使用 torch.norm 计算两个更新向量之差的L2范数
-                                distance = torch.norm(updates_flat[client_i_id] - updates_flat[client_j_id], p=2).item()
+                                cid_i, cid_j = client_ids[i], client_ids[j]
+                                distance = torch.norm(updates_flat[cid_i] - updates_flat[cid_j], p=2).item()
                                 distance_matrix[i, j] = distance
                                 distance_matrix[j, i] = distance
-
-                        # 1.2 计算每个客户端的“孤立度” (距离总和)
                         isolation_scores = np.sum(distance_matrix, axis=1)
 
-                        # 1.3 [修改] 使用MAD检测“孤立度”中的“异常高值”
                         median_iso = np.median(isolation_scores)
                         mad_iso = np.median(np.abs(isolation_scores - median_iso))
                         if mad_iso == 0: mad_iso = 1e-9
-
-                        score_threshold_dist = self.config["SIMILARITY_LOW_MAD_THRESHOLD"]  # 我们可以复用这个阈值名
+                        score_threshold = self.config["DISTANCE_MAD_THRESHOLD"]
                         for i in range(num_clients_in_round):
-                            score = isolation_scores[i]
-                            z_score = (score - median_iso) / mad_iso
-                            # [关键修改] 我们寻找的是孤立度“远高于”中位数的客户端
-                            if z_score > score_threshold_dist:
+                            if (isolation_scores[i] - median_iso) / mad_iso > score_threshold:
                                 behavioral_suspects.append(client_ids[i])
 
-                    print(f"    [调试-行为/距离] 检测到高孤立度嫌疑: {sorted(behavioral_suspects)}")
+                    print(f"    [调试-行为/距离] 检测到嫌疑: {sorted(behavioral_suspects)}")
 
-                    # --- Part 2: 后果异常检测 (基于“反转”的IDA) ---
-                    consequential_suspects = []
+                    # --- Part 2: 后果异常检测 (基于“相对”对抗性脆弱度) ---
+                    # 2.1 首先，计算当前全局模型的基准脆弱度
+                    vulnerability_base = calculate_adversarial_vulnerability(
+                        global_model_state_dict, self.probe_images, self.device, self.config
+                    )
 
-                    # --- Part 2: 后果异常检测 (基于对抗性脆弱度) ---
-                    vulnerability_suspects = []
-                    # 2.1 计算每个客户端引入的“对抗性脆弱度”
-                    vulnerability_scores = {
-                        cid: calculate_adversarial_vulnerability({k: global_model_state_dict[k] + u[k] for k in u},
-                                                                 self.probe_images, self.device, self.config) for cid, u
-                        in client_updates.items()}
-                    # --- [新增] 打印本轮所有客户端的脆弱度分数排名 ---
-                    score_list = sorted(list(vulnerability_scores.items()), key=lambda item: item[1], reverse=True)
-                    print("    [调试-脆弱度排名] (Client ID, Score, Type):")
-                    for client_id, score in score_list:
+                    # 2.2 计算每个更新引入的“脆弱度增量”
+                    vulnerability_deltas = {}
+                    for cid, update in client_updates.items():
+                        temp_model_state = {k: global_model_state_dict[k] + update[k] for k in update}
+                        vulnerability_post = calculate_adversarial_vulnerability(
+                            temp_model_state, self.probe_images, self.device, self.config
+                        )
+                        vulnerability_deltas[cid] = vulnerability_post - vulnerability_base
+
+                    # [调试功能] 打印本轮所有客户端的“相对脆弱度”分数排名
+                    delta_list = sorted(list(vulnerability_deltas.items()), key=lambda item: item[1], reverse=True)
+                    print("    [调试-相对脆弱度排名] (Client ID, Score, Type):")
+                    for client_id, score in delta_list:
                         client_type = "恶意" if client_id in self.malicious_ids else "良性"
                         print(f"      - Client {client_id:<2} | Score: {score:8.4f} | Type: {client_type}")
-                    # 2.2 使用MAD检测分数中的“异常高值”
-                    score_values = list(vulnerability_scores.values())
-                    if len(score_values) > 1:
-                        median_score = np.median(score_values)
-                        mad_score = np.median(np.abs(score_values - median_score))
-                        if mad_score == 0: mad_score = 1e-9
+                    # 2.3 使用MAD检测“增量”分数中的“异常低值”
+                    consequential_suspects = []
+                    delta_values = list(vulnerability_deltas.values())
+                    if len(delta_values) > 1:
+                        median_delta = np.median(delta_values)
+                        mad_delta = np.median(np.abs(delta_values - median_delta))
+                        if mad_delta == 0: mad_delta = 1e-9
+
+                        # 我们依然使用VULNERABILITY_MAD_THRESHOLD，但现在它作用于“增量”
                         score_threshold = self.config["VULNERABILITY_MAD_THRESHOLD"]
-                        for cid, score in vulnerability_scores.items():
-                            if (score - median_score) / mad_score > score_threshold:
-                                vulnerability_suspects.append(cid)
-                    print(f"    [调试-后果/脆弱度] 检测到嫌疑: {sorted(vulnerability_suspects)}")
+                        for cid, delta in vulnerability_deltas.items():
+                            z_score = (delta - median_delta) / mad_delta
+                            # 预期信号依然是反转的，所以我们寻找的是远低于中位数的客户端
+                            if z_score < -score_threshold:
+                                consequential_suspects.append(cid)
+
+                    print(f"    [调试-后果/相对脆弱度] 检测到嫌疑: {sorted(consequential_suspects)}")
 
                     # --- Part 3: 取交集，最终裁决 (AND Logic) ---
                     #suspicious_ids = sorted(list(set(behavioral_suspects) & set(consequential_suspects)))
