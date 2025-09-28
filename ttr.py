@@ -568,19 +568,30 @@ class Server:
                     # --- Part 2: 后果异常检测 (基于“反转”的IDA) ---
                     consequential_suspects = []
 
-                    delta_values = list(deltas.values())
-                    if len(delta_values) > 1:
-                        median_delta = np.median(delta_values)
-                        mad_delta = np.median(np.abs(delta_values - median_delta))
-                        if mad_delta == 0: mad_delta = 1e-9
-
-                        score_threshold_ida = self.config["IDA_LOW_MAD_THRESHOLD"]
-                        for client_id, delta in deltas.items():
-                            score_mad = (delta - median_delta) / mad_delta
-                            if score_mad < -score_threshold_ida:
-                                consequential_suspects.append(client_id)
-
-                    print(f"    [调试-后果] 检测到低稳定性嫌疑: {sorted(consequential_suspects)}")
+                    # --- Part 2: 后果异常检测 (基于对抗性脆弱度) ---
+                    vulnerability_suspects = []
+                    # 2.1 计算每个客户端引入的“对抗性脆弱度”
+                    vulnerability_scores = {
+                        cid: calculate_adversarial_vulnerability({k: global_model_state_dict[k] + u[k] for k in u},
+                                                                 self.probe_images, self.device, self.config) for cid, u
+                        in client_updates.items()}
+                    # --- [新增] 打印本轮所有客户端的脆弱度分数排名 ---
+                    score_list = sorted(list(vulnerability_scores.items()), key=lambda item: item[1], reverse=True)
+                    print("    [调试-脆弱度排名] (Client ID, Score, Type):")
+                    for client_id, score in score_list:
+                        client_type = "恶意" if client_id in self.malicious_ids else "良性"
+                        print(f"      - Client {client_id:<2} | Score: {score:8.4f} | Type: {client_type}")
+                    # 2.2 使用MAD检测分数中的“异常高值”
+                    score_values = list(vulnerability_scores.values())
+                    if len(score_values) > 1:
+                        median_score = np.median(score_values)
+                        mad_score = np.median(np.abs(score_values - median_score))
+                        if mad_score == 0: mad_score = 1e-9
+                        score_threshold = self.config["VULNERABILITY_MAD_THRESHOLD"]
+                        for cid, score in vulnerability_scores.items():
+                            if (score - median_score) / mad_score > score_threshold:
+                                vulnerability_suspects.append(cid)
+                    print(f"    [调试-后果/脆弱度] 检测到嫌疑: {sorted(vulnerability_suspects)}")
 
                     # --- Part 3: 取交集，最终裁决 (AND Logic) ---
                     #suspicious_ids = sorted(list(set(behavioral_suspects) & set(consequential_suspects)))
