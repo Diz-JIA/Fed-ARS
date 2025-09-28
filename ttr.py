@@ -6,8 +6,10 @@
 @Description: 成对余弦相似度+IDA双重审查
             没有wandb版本
 @History :
+- 2025/9/26, v1.3：
+    - 将IDA反转使用，成对余弦相似度替换为成对欧式距离
 - 2025/9/25, v1.2：
-    - 将IDA反转使用，成对余弦相似度保留
+    - 将IDA反转使用，成对余弦相似度保留（两者检测结果取交集）
 - 2025/9/25, v1.1：
     - 成对余弦相似度+IDA双重审查
     - 在后门攻击场景下效果依然很差
@@ -26,6 +28,7 @@ import matplotlib.pyplot as plt
 import os
 import csv
 import argparse
+import torch.nn.functional as F
 
 
 
@@ -60,6 +63,11 @@ config = {
     "DEFENSE_START_ROUND": 5,  # 从第5轮开始执行防御，给模型一点初始收敛时间
 
     # 双重审查模型参数
+    "ADVERSARIAL_EPSILON": 0.05, # FGSM扰动大小，一个常用的值
+    "VULNERABILITY_MAD_THRESHOLD": 3.0,  # 值越高越严格
+
+    "DISTANCE_MAD_THRESHOLD": 2.5,  # 值越高越严格
+
     "PERTURBATION_STRENGTH": 0.1,  # 扰动强度
     "SIMILARITY_LOW_MAD_THRESHOLD": 2.0, # 相似度声望分的“低分”阈值 (越小越宽松)
     "IDA_LOW_MAD_THRESHOLD": 2.0,         # IDA不稳定性增量的“低分”阈值 (越小越宽松)
@@ -68,7 +76,7 @@ config = {
 
     # 声誉与降权模块参数
 
-    "REPUTATION_DECAY_FACTOR": 0.8, # γ值 (gamma)
+    "REPUTATION_DECAY_FACTOR": 0.5, # γ值 (gamma)
 
 
     # 学习率调度器 (Scheduler) 设置
@@ -134,6 +142,12 @@ class SimpleCNN(nn.Module):
 
     def get_penultimate_features(self, x):
         return self.fc_stack(self.conv_stack(x))
+
+    # --- [新增] 一次性返回最终输出和特征的优化方法 ---
+    def forward_with_features(self, x):
+        penultimate_features = self.fc_stack(self.conv_stack(x))
+        logits = self.classifier(penultimate_features)
+        return logits, penultimate_features
 
 
 def get_cifar10_data():
@@ -336,6 +350,36 @@ def calculate_instability_score(model_state_dict, probe_images, device, config):
 
     return np.mean(scores)
 
+
+def calculate_adversarial_vulnerability(model_state_dict, probe_images, device, config):
+    model = SimpleCNN().to(device)
+    model.load_state_dict(model_state_dict)
+    model.eval()
+
+    epsilon = config["ADVERSARIAL_EPSILON"]
+    scores = []
+
+    for img in probe_images:
+        img = img.unsqueeze(0).to(device)
+        img.requires_grad = True
+
+        # [优化] 使用新方法，一次前向传播同时获得输出和特征
+        outputs, features_clean = model.forward_with_features(img)
+
+        loss = F.nll_loss(outputs, outputs.max(1)[1])
+        model.zero_grad()
+        loss.backward()
+
+        grad_sign = img.grad.data.sign()
+        adversarial_img = torch.clamp(img + epsilon * grad_sign, -1, 1)
+
+        with torch.no_grad():
+            features_adversarial = model.get_penultimate_features(adversarial_img)
+            score = 1 - F.cosine_similarity(features_clean, features_adversarial).item()
+            scores.append(score)
+
+    return np.mean(scores)
+
 def clip_update_norm_(update, max_norm):
     """
     对单个客户端的更新字典 (update) 进行原地范数裁剪。
@@ -474,41 +518,55 @@ class Server:
                     client_ids = list(clipped_updates.keys())
                     num_clients_in_round = len(client_ids)
 
-                    # --- Part 1: 行为异常检测 (基于两两相似度) ---
-                    behavioral_suspects = []
-                    if num_clients_in_round > 1:
-                        updates_flat = {cid: torch.cat([p.flatten() for p in upd.values()]) for cid, upd in
-                                        clipped_updates.items()}
-                        similarity_matrix = np.ones((num_clients_in_round, num_clients_in_round))
-                        for i in range(num_clients_in_round):
-                            for j in range(i + 1, num_clients_in_round):
-                                client_i_id, client_j_id = client_ids[i], client_ids[j]
-                                cos = nn.CosineSimilarity(dim=0, eps=1e-6)
-                                similarity = cos(updates_flat[client_i_id], updates_flat[client_j_id]).item()
-                                similarity_matrix[i, j] = similarity
-                                similarity_matrix[j, i] = similarity
-                        reputation_scores_round = np.sum(similarity_matrix, axis=1)
-
-                        median_rep = np.median(reputation_scores_round)
-                        mad_rep = np.median(np.abs(reputation_scores_round - median_rep))
-                        if mad_rep == 0: mad_rep = 1e-9
-
-                        score_threshold_sim = self.config["SIMILARITY_LOW_MAD_THRESHOLD"]
-                        for i in range(num_clients_in_round):
-                            score = reputation_scores_round[i]
-                            z_score = (score - median_rep) / mad_rep
-                            if z_score < -score_threshold_sim:
-                                behavioral_suspects.append(client_ids[i])
-
-                    print(f"    [调试-行为] 检测到低相似度嫌疑: {sorted(behavioral_suspects)}")
-
-                    # --- Part 2: 后果异常检测 (基于“反转”的IDA) ---
-                    consequential_suspects = []
+                    #  打印IDA分数排名
                     score_base = calculate_instability_score(global_model_state_dict, self.probe_images, self.device,
                                                              self.config)
                     deltas = {cid: calculate_instability_score({k: global_model_state_dict[k] + u[k] for k in u},
                                                                self.probe_images, self.device, self.config) - score_base
                               for cid, u in client_updates.items()}
+
+                    delta_list = sorted(list(deltas.items()), key=lambda item: item[1], reverse=True)
+                    print("    [调试-IDA分数排名] (Client ID, Score, Type):")
+                    for client_id, score in delta_list:
+                        client_type = "恶意" if client_id in self.malicious_ids else "良性"
+                        print(f"      - Client {client_id:<2} | Score: {score:8.4f} | Type: {client_type}")
+
+                    # --- Part 1: 行为异常检测 (基于两两欧氏距离) ---
+                    behavioral_suspects = []
+                    if num_clients_in_round > 1:
+                        updates_flat = {cid: torch.cat([p.flatten() for p in upd.values()]) for cid, upd in
+                                        clipped_updates.items()}
+                        distance_matrix = np.zeros((num_clients_in_round, num_clients_in_round))
+
+                        # 1.1 [修改] 计算两两欧氏距离
+                        for i in range(num_clients_in_round):
+                            for j in range(i + 1, num_clients_in_round):
+                                client_i_id, client_j_id = client_ids[i], client_ids[j]
+                                # 使用 torch.norm 计算两个更新向量之差的L2范数
+                                distance = torch.norm(updates_flat[client_i_id] - updates_flat[client_j_id], p=2).item()
+                                distance_matrix[i, j] = distance
+                                distance_matrix[j, i] = distance
+
+                        # 1.2 计算每个客户端的“孤立度” (距离总和)
+                        isolation_scores = np.sum(distance_matrix, axis=1)
+
+                        # 1.3 [修改] 使用MAD检测“孤立度”中的“异常高值”
+                        median_iso = np.median(isolation_scores)
+                        mad_iso = np.median(np.abs(isolation_scores - median_iso))
+                        if mad_iso == 0: mad_iso = 1e-9
+
+                        score_threshold_dist = self.config["SIMILARITY_LOW_MAD_THRESHOLD"]  # 我们可以复用这个阈值名
+                        for i in range(num_clients_in_round):
+                            score = isolation_scores[i]
+                            z_score = (score - median_iso) / mad_iso
+                            # [关键修改] 我们寻找的是孤立度“远高于”中位数的客户端
+                            if z_score > score_threshold_dist:
+                                behavioral_suspects.append(client_ids[i])
+
+                    print(f"    [调试-行为/距离] 检测到高孤立度嫌疑: {sorted(behavioral_suspects)}")
+
+                    # --- Part 2: 后果异常检测 (基于“反转”的IDA) ---
+                    consequential_suspects = []
 
                     delta_values = list(deltas.values())
                     if len(delta_values) > 1:
@@ -525,7 +583,8 @@ class Server:
                     print(f"    [调试-后果] 检测到低稳定性嫌疑: {sorted(consequential_suspects)}")
 
                     # --- Part 3: 取交集，最终裁决 (AND Logic) ---
-                    suspicious_ids = sorted(list(set(behavioral_suspects) & set(consequential_suspects)))
+                    #suspicious_ids = sorted(list(set(behavioral_suspects) & set(consequential_suspects)))
+                    suspicious_ids = sorted(list(set(behavioral_suspects) | set(consequential_suspects)))
 
                     if suspicious_ids:
                         print(f"    [侦测模块] 本轮最终可疑客户端: {suspicious_ids}")
