@@ -43,7 +43,7 @@ config = {
     "SEED": 123,
 
     # 实验日志文件路径
-    "LOG_FILE_PATH": "./log/ttr_simulation/scene3.csv",
+    "LOG_FILE_PATH": "results/logs/ttr_simulation/scene3.csv",
 
     # 联邦学习设置
     "NUM_CLIENTS": 20,  # 增加客户端总数以更好地模拟统计检测
