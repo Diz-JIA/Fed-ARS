@@ -54,7 +54,7 @@ def run_experiment():
         config_no_attack["DEFENSE_ENABLED"] = False
         config_no_attack["SCENARIO_NAME"] = "no_attack"
 
-        clients_no_attack = [Client(i, client_datasets[i], is_malicious=False, config=config_no_attack) for i in range(config["NUM_CLIENTS"])]
+        clients_no_attack = [Client(i, client_datasets[i], is_malicious=False,config=config) for i in range(config["NUM_CLIENTS"])]
         # 将更新后的config传入Server
         server_no_attack = Server(clients_no_attack, test_loader, config_no_attack)
         history_no_attack = server_no_attack.run_simulation()
@@ -95,7 +95,7 @@ def run_experiment():
         config_under_attack["SCENARIO_NAME"] = "under_attack_no_defense"
 
         clients_under_attack = [
-            Client(i, client_datasets[i], is_malicious=(i < config_under_attack["MALICIOUS_CLIENTS"]), config=config_under_attack)
+            Client(i, client_datasets[i], is_malicious=(i < config_under_attack["MALICIOUS_CLIENTS"]))
             for i in range(config["NUM_CLIENTS"])]
         # [新增] 打印本场景的恶意客户端ID列表
         malicious_ids_2 = [c.client_id for c in clients_under_attack if c.is_malicious]
@@ -140,7 +140,7 @@ def run_experiment():
         config_with_defense["SCENARIO_NAME"] = "with_defense"
 
         clients_with_defense = [
-            Client(i, client_datasets[i], is_malicious=(i < config_with_defense["MALICIOUS_CLIENTS"]), config=config_with_defense)
+            Client(i, client_datasets[i], is_malicious=(i < config_with_defense["MALICIOUS_CLIENTS"]))
             for i in range(config["NUM_CLIENTS"])]
 
         # [新增] 打印本场景的恶意客户端ID列表
