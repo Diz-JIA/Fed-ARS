@@ -19,7 +19,7 @@ config = {
     "LEARNING_RATE": 0.01,
 
     # 攻击设置
-    "ATTACK_TYPE": "min_max",
+    "ATTACK_TYPE": "label_flipping",
     "MALICIOUS_CLIENTS": 8,
     "POISON_RATIO": 0.7,
     "BACKDOOR_TRIGGER_SIZE": 5,
@@ -27,7 +27,7 @@ config = {
 
     # 防御设置
     "DEFENSE_ENABLED": True,  # 是否启用在线防御
-    "DEFENSE_START_ROUND": 5,  # 从第5轮开始执行防御，给模型一点初始收敛时间
+    "DEFENSE_START_ROUND": 1,  # 从第5轮开始执行防御，给模型一点初始收敛时间
 
     # 双重审查模型参数
     "ADVERSARIAL_EPSILON": 0.05,  # FGSM扰动大小，一个常用的值
@@ -42,7 +42,7 @@ config = {
     "CLIP_MAX_NORM":1.2,  #裁剪阈值
 
     # 声誉与降权模块参数
-
+    "REPUTATION_THRESHOLD": 4,
     "REPUTATION_DECAY_FACTOR": 0.5, # γ值 (gamma)
 
 
