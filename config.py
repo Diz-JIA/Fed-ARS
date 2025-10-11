@@ -19,7 +19,7 @@ config = {
     "LEARNING_RATE": 0.01,
 
     # 攻击设置
-    "ATTACK_TYPE": "min_max",
+    "ATTACK_TYPE": "backdoor",
     "MALICIOUS_CLIENTS": 8,
     "POISON_RATIO": 0.7,
     "BACKDOOR_TRIGGER_SIZE": 5,
@@ -27,13 +27,13 @@ config = {
 
     # 防御设置
     "DEFENSE_ENABLED": True,  # 是否启用在线防御
-    "DEFENSE_START_ROUND": 5,  # 从第5轮开始执行防御，给模型一点初始收敛时间
+    "DEFENSE_START_ROUND": 6,  # 从第5轮开始执行防御，给模型一点初始收敛时间
 
     # 双重审查模型参数
     "ADVERSARIAL_EPSILON": 0.05,  # FGSM扰动大小，一个常用的值
-    "VULNERABILITY_MAD_THRESHOLD": 3.0,  # 值越高越严格
+    "VULNERABILITY_MAD_THRESHOLD": 2.5,  # 值越低越防御系统越敏感
 
-    "DISTANCE_MAD_THRESHOLD": 2.5,  # 值越高越严格
+    "DISTANCE_MAD_THRESHOLD": 2.5,  # 值越低越防御系统越敏感
 
     "PERTURBATION_STRENGTH": 0.1,  # 扰动强度
     "SIMILARITY_LOW_MAD_THRESHOLD": 2.0, # 相似度声望分的“低分”阈值 (越小越宽松)
@@ -42,7 +42,7 @@ config = {
     "CLIP_MAX_NORM":1.2,  #裁剪阈值
 
     # 声誉与降权模块参数
-
+    "REPUTATION_THRESHOLD":4,
     "REPUTATION_DECAY_FACTOR": 0.5, # γ值 (gamma)
 
 

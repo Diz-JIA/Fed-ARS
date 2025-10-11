@@ -8,7 +8,7 @@ import os
 from .models import SimpleCNN
 from .utils import evaluate_model
 from .attack_strategies import attack_strategy_factory
-from .defense import calculate_adversarial_vulnerability, clip_update_norm_
+from .defense import calculate_adversarial_vulnerability, clip_update_norm_, calculate_sparsity_score
 
 
 class Server:
@@ -163,7 +163,8 @@ class Server:
 
         # --- Part 3: 取并集，最终裁决 (OR Logic) ---
         # suspicious_ids = sorted(list(set(behavioral_suspects) & set(consequential_suspects)))
-        suspicious_ids = sorted(list(set(behavioral_suspects) | set(consequential_suspects)))
+        # suspicious_ids = sorted(list(set(behavioral_suspects) | set(consequential_suspects)))
+        suspicious_ids = sorted(list(set(consequential_suspects)))
 
         if suspicious_ids:
             print(f"    [侦测模块] 本轮最终可疑客户端: {suspicious_ids}")
@@ -288,8 +289,38 @@ class Server:
         )
 
     def _select_clients(self):
-        num_to_select = min(self.config["CLIENTS_PER_ROUND"], len(self.active_clients_pool))
-        return random.sample(self.active_clients_pool, num_to_select)
+        """
+                选择客户端，并确保每轮选中的恶意客户端数量【严格小于】一半。
+                """
+        num_to_select = self.config["CLIENTS_PER_ROUND"]
+
+        # --- [核心修改] ---
+        # 计算严格小于一半的最大恶意客户端数量
+        max_malicious_allowed = (num_to_select - 1) // 2
+        # --- 修改结束 ---
+
+        # 1. 将活跃客户端池分为良性 H 和恶意 M 两个子池
+        benign_pool = [c for c in self.active_clients_pool if not c.is_malicious]
+        malicious_pool = [c for c in self.active_clients_pool if c.is_malicious]
+
+        # 2. 确定要从每个池中抽样的数量
+        num_malicious_to_sample = min(max_malicious_allowed, len(malicious_pool))
+        num_benign_to_sample = min(num_to_select - num_malicious_to_sample, len(benign_pool))
+
+        # 3. 从两个池中分别进行随机抽样
+        selected_malicious = random.sample(malicious_pool, num_malicious_to_sample)
+        selected_benign = random.sample(benign_pool, num_benign_to_sample)
+
+        # 4. 合并并打乱顺序
+        selected_clients = selected_malicious + selected_benign
+        random.shuffle(selected_clients)
+
+        # 攻击监控日志 (逻辑不变)
+        if self.config.get("MALICIOUS_CLIENTS", 0) > 0:
+            actual_malicious_ids = sorted([c.client_id for c in selected_clients if c.is_malicious])
+            print(f"    [攻击监控] 本轮选中了 {len(actual_malicious_ids)} 个恶意客户端: {actual_malicious_ids}")
+
+        return selected_clients
 
     def _dispatch_and_collect_updates(self, selected_clients):
         client_updates = {}
@@ -297,7 +328,7 @@ class Server:
         current_lr = self.optimizer.param_groups[0]['lr']
 
         for client in selected_clients:
-            update = client.train(global_model_state_dict, current_lr, self.config)
+            update = client.train(global_model_state_dict, current_lr)
             client_updates[client.client_id] = update
         return client_updates
 
