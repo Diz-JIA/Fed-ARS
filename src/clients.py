@@ -36,7 +36,7 @@ class Client:
         # [修改] 差异化本地训练轮数
         epochs_to_run = self.config["LOCAL_EPOCHS"]
         if self.is_malicious:
-            epochs_to_run = self.config["LOCAL_EPOCHS"] * 4  # 例如，恶意客户端的训练轮数是诚实的2倍
+            epochs_to_run = self.config["LOCAL_EPOCHS"] # 例如，恶意客户端的训练轮数是诚实的2倍
             # 您也可以在这里设置一个固定的更多轮数，比如 10
 
         model.train()

@@ -34,7 +34,8 @@ class Server:
         # 初始化攻击策略
         attack_type = self.config.get("ATTACK_TYPE", "backdoor")
         if attack_type in attack_strategy_factory:
-            self.attack_strategy = attack_strategy_factory[attack_type]()
+            # 将 self.config 传递给攻击策略的构造函数
+            self.attack_strategy = attack_strategy_factory[attack_type](self.config)
         else:
             raise ValueError(f"未知的攻击类型: {attack_type}")
 
@@ -86,40 +87,7 @@ class Server:
     # --- 私有辅助函数 ---
     def _run_defense(self, client_updates):
 
-        # --- “双重审查”防御模型 ---
-        # --- Part 0: 预处理 (梯度裁剪) ---
-        CLIP_MAX_NORM = self.config["CLIP_MAX_NORM"]  # 这是一个超参数，您可以按需调整
-        # 注意：我们克隆一份用于裁剪，以防未来需要原始更新
-        clipped_updates = copy.deepcopy(client_updates)
-        for client_id in clipped_updates.keys():
-            clip_update_norm_(clipped_updates[client_id], CLIP_MAX_NORM)
-        # print(f"    [防御流程] 已对更新执行范数裁剪 (上限={CLIP_MAX_NORM})，用于后续分析。")
-        client_ids = list(clipped_updates.keys())
-        num_clients_in_round = len(client_ids)
 
-        # --- Part 1: 行为异常检测 (基于两两欧氏距离) ---
-        behavioral_suspects = []
-        if num_clients_in_round > 1:
-            updates_flat = {cid: torch.cat([p.flatten() for p in upd.values()]) for cid, upd in
-                            clipped_updates.items()}
-            distance_matrix = np.zeros((num_clients_in_round, num_clients_in_round))
-            for i in range(num_clients_in_round):
-                for j in range(i + 1, num_clients_in_round):
-                    cid_i, cid_j = client_ids[i], client_ids[j]
-                    distance = torch.norm(updates_flat[cid_i] - updates_flat[cid_j], p=2).item()
-                    distance_matrix[i, j] = distance
-                    distance_matrix[j, i] = distance
-            isolation_scores = np.sum(distance_matrix, axis=1)
-
-            median_iso = np.median(isolation_scores)
-            mad_iso = np.median(np.abs(isolation_scores - median_iso))
-            if mad_iso == 0: mad_iso = 1e-9
-            score_threshold = self.config["DISTANCE_MAD_THRESHOLD"]
-            for i in range(num_clients_in_round):
-                if (isolation_scores[i] - median_iso) / mad_iso > score_threshold:
-                    behavioral_suspects.append(client_ids[i])
-
-        print(f"    [调试-行为/距离] 检测到嫌疑: {sorted(behavioral_suspects)}")
 
         # --- Part 2: 后果异常检测 (基于“相对”对抗性脆弱度) ---
         # 2.1 首先，计算当前全局模型的基准脆弱度
@@ -151,19 +119,26 @@ class Server:
             mad_delta = np.median(np.abs(delta_values - median_delta))
             if mad_delta == 0: mad_delta = 1e-9
 
-            # 我们依然使用VULNERABILITY_MAD_THRESHOLD，但现在它作用于“增量”
-            score_threshold = self.config["VULNERABILITY_MAD_THRESHOLD"]
+            # --- [核心修改] 动态计算阈值 ---
+            base_threshold = self.config["VULNERABILITY_MAD_THRESHOLD"]
+            num_total_clients = self.config["NUM_CLIENTS"]
+            num_active_clients = len(self.active_clients_pool)
+
+            # 客户端越少，阈值越宽松 (这里使用线性增长，也可以用其他函数)
+            # 当客户端数量从总数降低到0时，阈值从 base_threshold 增长到 base_threshold * 2
+            scaling_factor = 1.0 + (1.0 - (num_active_clients / num_total_clients))
+            score_threshold = base_threshold * scaling_factor
+            # 可以在这里打印一下动态阈值，方便调试
+            print(f"    [调试-动态阈值] 当前活跃客户端: {num_active_clients}, 阈值缩放因子: {scaling_factor:.2f}, 最终阈值: {score_threshold:.2f}")
+
             for cid, delta in vulnerability_deltas.items():
                 z_score = (delta - median_delta) / mad_delta
-                # 预期信号依然是反转的，所以我们寻找的是远低于中位数的客户端
-                if z_score < -score_threshold:
+                if abs(z_score) > score_threshold:  # 使用动态阈值
                     consequential_suspects.append(cid)
 
         print(f"    [调试-后果/相对脆弱度] 检测到嫌疑: {sorted(consequential_suspects)}")
 
         # --- Part 3: 取并集，最终裁决 (OR Logic) ---
-        # suspicious_ids = sorted(list(set(behavioral_suspects) & set(consequential_suspects)))
-        # suspicious_ids = sorted(list(set(behavioral_suspects) | set(consequential_suspects)))
         suspicious_ids = sorted(list(set(consequential_suspects)))
 
         if suspicious_ids:
@@ -176,19 +151,43 @@ class Server:
             if client_id in self.reputation_scores:
                 self.reputation_scores[client_id] += 1
 
+        # --- [新增逻辑] 为表现良好的客户端降低声誉分 ---
+        # 1. 获取本轮所有活跃且未被怀疑的客户端ID
+        active_ids_in_round = {c.client_id for c in self.active_clients_pool if
+                               c.client_id in self.reputation_scores}
+        non_suspicious_ids = active_ids_in_round - set(suspicious_ids)
+
+        # 2. 对这些客户端的声誉分进行衰减
+        decay_amount = 1  # 这个值可以放入config中，代表“洗白”的速度
+        for cid in non_suspicious_ids:
+            self.reputation_scores[cid] = max(0, self.reputation_scores[cid] - decay_amount)
+
         # 检查并移除客户端
         clients_to_remove = [cid for cid, score in self.reputation_scores.items()
                              if score > self.config["REPUTATION_THRESHOLD"]]
 
         if clients_to_remove:
-            initial_pool_size = len(self.active_clients_pool)
-            self.active_clients_pool = [c for c in self.active_clients_pool if c.client_id not in clients_to_remove]
+            # --- [核心修改] 将待移除客户端分类 ---
+            removed_malicious = []
+            removed_benign = []
+            for cid in clients_to_remove:
+                if cid in self.malicious_ids:
+                    removed_malicious.append(cid)
+                else:
+                    removed_benign.append(cid)
 
-            # 从声誉分中也移除，防止重复判断
+            # --- 从活跃池和声誉字典中执行移除操作 ---
+            self.active_clients_pool = [c for c in self.active_clients_pool if c.client_id not in clients_to_remove]
             for cid in clients_to_remove:
                 del self.reputation_scores[cid]
 
-            print(f"    [防御系统] 客户端 {clients_to_remove} 声誉分超过阈值，已被永久移除。")
+            # --- [核心修改] 分类打印移除信息 ---
+            if removed_malicious:
+                print(f"    [防御系统] 成功移除恶意客户端: {sorted(removed_malicious)}")
+            if removed_benign:
+                # 使用醒目的 "警告" 标签提示误伤
+                print(f"    [防御系统-警告] 误伤良性客户端: {sorted(removed_benign)}")
+
             print(f"    [防御系统] 剩余活跃客户端数量: {len(self.active_clients_pool)}")
 
     def _aggregate_updates(self, client_updates, suspicious_ids):
@@ -245,7 +244,7 @@ class Server:
 
         current_lr = self.optimizer.param_groups[0]['lr']
         print(
-            f"    >> 第 {round_num} 轮结束 | 当前LR: {current_lr:.6f} | 测试损失: {test_loss:.4f} | 全局模型准确率: {accuracy * 100:.2f}%")
+            f"    >> 第 {round_num + 1} 轮结束 | 当前LR: {current_lr:.6f} | 测试损失: {test_loss:.4f} | 全局模型准确率: {accuracy * 100:.2f}%")
 
         if self.scheduler:
             self.scheduler.step(test_loss)

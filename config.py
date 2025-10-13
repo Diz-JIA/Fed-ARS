@@ -19,11 +19,13 @@ config = {
     "LEARNING_RATE": 0.01,
 
     # 攻击设置
-    "ATTACK_TYPE": "backdoor",
+    "ATTACK_TYPE": "sign_flipping",
     "MALICIOUS_CLIENTS": 8,
     "POISON_RATIO": 0.7,
     "BACKDOOR_TRIGGER_SIZE": 5,
     "BACKDOOR_TARGET_LABEL": 0,
+    "LIE_ATTACK_S_VALUE": 10.0, # LIE攻击的强度参数
+    "NOISE_ATTACK_STD": 0.15, # 噪声攻击的标准差
 
     # 防御设置
     "DEFENSE_ENABLED": True,  # 是否启用在线防御

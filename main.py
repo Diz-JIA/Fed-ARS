@@ -201,6 +201,7 @@ def run_experiment():
 
     # 3. (可选) 保留与server对象相关的打印逻辑
     #    因为server_with_defense只在主文件中存在，所以这部分总结最好保留在这里。
+    """
     if history_with_defense and 'server_with_defense' in locals():
         print("\n--- 防御效果总结 ---")
         final_reputations = server_with_defense.reputation_scores
@@ -215,7 +216,7 @@ def run_experiment():
             for cid, rep in suspicious_clients_sorted:
                 is_malicious_str = "恶意" if cid < config["MALICIOUS_CLIENTS"] else "良性"
                 print(f"    客户端 {cid} ({is_malicious_str}): 声誉分 = {rep}")
-
+    """
 
 if __name__ == "__main__":
     run_experiment()
