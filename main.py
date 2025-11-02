@@ -7,7 +7,7 @@ from torch.utils.data import DataLoader
 from config import config
 from src.attacks import evaluate_backdoor_asr
 from src.clients import Client
-from src.data_loader import get_cifar10_data, create_iid_partitions
+from src.data_loader import get_data, partition_strategy_factory
 from src.server import Server
 from src.utils import set_seed, log_experiment_results, plot_results
 
@@ -27,11 +27,46 @@ def run_experiment():
     # print(f"[实验配置] IDA阈值 = {config["OUTLIER_THRESHOLD"]},相似度阈值 = {config["SIMILARITY_THRESHOLD"]},声誉容忍度 = {config["REPUTATION_THRESHOLD"]},扰动强度 = {config["PERTURBATION_STRENGTH"]}")
 
     set_seed(config["SEED"])
+    print("===============      实验配置概览      ===============")
+    print(f"    - 初始学习率:  {config.get('LEARNING_RATE')}, 本地轮次: {config.get('LOCAL_EPOCHS')}, 批次大小:  {config.get('BATCH_SIZE')}")
+
+    if 2 in scenarios_to_run or 3 in scenarios_to_run:
+        attack_type = config.get('ATTACK_TYPE')
+        if attack_type == 'lie':
+            print(f"    - LIE Z-Score (s): {config.get('LIE_ATTACK_S_VALUE')}")
+        elif attack_type == 'min_max':
+            print(f"    - Min-Max 攻击 beta: {config.get('MINMAX_BETA')}")
+        elif attack_type == 'label_flipping':
+            print(f"    - Label-Flipping 攻击投毒率： {config.get('POISON_RATIO')}")
+        elif attack_type == 'backdoor':
+            print(f"    - 投毒比例:    {config.get('POISON_RATIO')}")
+            print(f"    - 目标标签:    {config.get('BACKDOOR_TARGET_LABEL')}")
+        elif attack_type == 'label_shuffling':
+            print("    - 标签洗牌 (污染 100% 本地数据)")
+        elif attack_type == 'sign_flipping':
+            print("    - 符号反转 (无特定参数)")
+        elif attack_type == 'noise':
+            print(f"    - 噪声标准差 (Std): {config.get('NOISE_ATTACK_STD')}")
 
     # 1. 准备全局数据和客户端池
-    train_dataset, test_dataset = get_cifar10_data()
-    test_loader = DataLoader(test_dataset, batch_size=128, shuffle=False)
-    client_datasets = create_iid_partitions(train_dataset, config["NUM_CLIENTS"])
+    train_dataset, test_dataset = get_data(config)
+
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=config["BATCH_SIZE"],
+        shuffle=False
+    )
+
+    # 3. 划分训练集
+    # --- [修改] 3. 动态划分训练集 (IID 或 Non-IID) ---
+    partition_strategy_name = config.get("DATA_PARTITION_STRATEGY", "iid")
+    try:
+        partition_func = partition_strategy_factory[partition_strategy_name]
+    except KeyError:
+        raise ValueError(f"未知的数据分区策略: {partition_strategy_name}")
+
+    # 两个函数现在都统一接收 (dataset, config)
+    client_datasets = partition_func(train_dataset, config)
 
     # 定义需要记录到日志的通用参数
     common_params_to_log = {
@@ -47,7 +82,7 @@ def run_experiment():
     # [修改] 3. 使用 "if" 语句包裹每个场景
     if 1 in scenarios_to_run:
         # --- 场景一: 无攻击 ---
-        print("\n\n=============== 场景一: 无攻击环境 ===============")
+        print("=============== 场景一: 无攻击环境 ===============")
 
         config_no_attack = copy.deepcopy(config)
         config_no_attack["MALICIOUS_CLIENTS"] = 0
@@ -88,7 +123,7 @@ def run_experiment():
 
     if 2 in scenarios_to_run:
         # --- 场景二: 有攻击, 无防御 ---
-        print("\n\n=============== 场景二: 有攻击, 无防御 ===============")
+        print("=============== 场景二: 有攻击, 无防御 ===============")
 
         config_under_attack = copy.deepcopy(config)
         config_under_attack["DEFENSE_ENABLED"] = False
@@ -132,7 +167,7 @@ def run_experiment():
 
     if 3 in scenarios_to_run:
         # --- 场景三: 有攻击, 有您的IDA防御 ---
-        print("\n\n=============== 场景三: 有攻击, 启用IDA防御 ===============")
+        print("=============== 场景三: 有攻击, 启用IDA防御 ===============")
         print(f"    [攻击设置] {config["ATTACK_TYPE"]}")
 
         config_with_defense = copy.deepcopy(config)
@@ -154,6 +189,25 @@ def run_experiment():
         final_asr = evaluate_backdoor_asr(server_with_defense.global_model, test_loader, config["DEVICE"],
                                           config_with_defense)
         print(f"    [评估] 最终攻击成功率 (ASR): {final_asr:.2f}%")
+
+        print("\n    --- 防御统计总结 ---")
+        total_mal_removed = server_with_defense.total_malicious_removed
+        total_ben_removed = server_with_defense.total_benign_removed
+        initial_malicious = config_with_defense["MALICIOUS_CLIENTS"]
+        initial_benign = config_with_defense["NUM_CLIENTS"] - initial_malicious
+
+        all_removed_round = server_with_defense.all_malicious_removed_round
+
+        print(f"    - 成功移除恶意客户端: {total_mal_removed} / {initial_malicious}")
+        if initial_benign > 0:  # 避免除以零
+            print(f"    - 错误移除良性客户端: {total_ben_removed} / {initial_benign}")
+        else:
+            print(f"    - 错误移除良性客户端: {total_ben_removed} (总良性客户端为 0)")
+
+        if all_removed_round != -1:
+            print(f"    - 所有恶意客户端在第 {all_removed_round} 轮被移除")
+        else:
+            print(f"    - 在训练结束时未能移除所有恶意客户端")
 
         ### 修改 ###: 复用通用参数，并添加场景特定参数
         params_log_3 = common_params_to_log.copy()
@@ -179,12 +233,13 @@ def run_experiment():
         metrics_log_3 = {
             "actual_rounds": actual_rounds_3,
             "final_accuracy": f"{history_with_defense['accuracy'][-1] * 100:.2f}%",
-            "downweighted_malicious": downweighted_malicious_count,
-            "downweighted_benign": downweighted_benign_count,
+            # 使用 server 对象中记录的总数
+            "malicious_removed": total_mal_removed,
+            "benign_removed": total_ben_removed,
+            "all_malicious_removed_at_round": all_removed_round,
             "final_asr": f"{final_asr:.2f}%"
         }
         log_experiment_results(config["LOG_FILE_PATH"], "3", params_log_3, metrics_log_3)
-
     # print(f"\n[日志] 所有场景已成功记录到: {config['LOG_FILE_PATH']}")
 
     # --- [核心修改] 结果可视化 ---

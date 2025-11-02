@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
-from .models import SimpleCNN # 从同目录的models.py导入SimpleCNN
+from . import models
 
 
 def calculate_instability_score(model_state_dict, probe_images, device, config):
@@ -17,7 +17,16 @@ def calculate_instability_score(model_state_dict, probe_images, device, config):
     Returns:
         float: 模型的不稳定性分数（平均余弦不相似度）。
     """
-    model = SimpleCNN().to(device)
+    model_name = config.get("MODEL_NAME", "simple_cnn")
+    if model_name in models.model_factory:
+        model_constructor = models.model_factory[model_name]
+        model = model_constructor(
+            in_channels=config["in_channels"],
+            num_classes=config["num_classes"]
+        ).to(device)
+        model.load_state_dict(model_state_dict)
+    else:
+        raise ValueError(f"未知的模型名称: {model_name}")
     model.load_state_dict(model_state_dict)
     model.eval()
 
@@ -39,7 +48,16 @@ def calculate_adversarial_vulnerability(model_state_dict, probe_images, device, 
     [新版] 通过FGSM计算模型的“对抗性脆弱度分数”。
     此版本比较的是最后一层 (Logits) 的差异。
     """
-    model = SimpleCNN().to(device)
+    model_name = config.get("MODEL_NAME", "simple_cnn")
+    if model_name in models.model_factory:
+        model_constructor = models.model_factory[model_name]
+        model = model_constructor(
+            in_channels=config["in_channels"],
+            num_classes=config["num_classes"]
+        ).to(device)
+        model.load_state_dict(model_state_dict)
+    else:
+        raise ValueError(f"未知的模型名称: {model_name}")
     model.load_state_dict(model_state_dict)
     model.eval()
 
@@ -88,12 +106,18 @@ def clip_update_norm_(update, max_norm):
         update (dict): 客户端模型更新的 state_dict。
         max_norm (float): 范数上限。
     """
-    flat_update = torch.cat([p.flatten() for p in update.values()])
-    norm = torch.norm(flat_update, p=2)  # p=2指明使用L2范数
+    # [核心修改] 在计算范数时，只考虑浮点类型的张量
+    flat_update = torch.cat([p.flatten() for p in update.values() if p.is_floating_point()])
+    if flat_update.numel() == 0:
+        return  # 如果没有任何浮点参数，则直接返回
+
+    norm = torch.norm(flat_update, p=2)
     if norm > max_norm:
         clip_coef = max_norm / (norm + 1e-6)
         for param in update.values():
-            param.mul_(clip_coef)
+            # [核心修改] 同样，只对浮点类型的张量进行乘法操作
+            if param.is_floating_point():
+                param.mul_(clip_coef)
 
 
 def calculate_sparsity_score(update):

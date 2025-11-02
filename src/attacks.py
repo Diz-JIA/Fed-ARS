@@ -78,7 +78,7 @@ def evaluate_backdoor_asr(model, test_loader, device, config):
 
 
 class LabelFlippingDataset(Dataset):
-    def __init__(self, original_dataset, poison_ratio, num_classes=10):
+    def __init__(self, original_dataset, poison_ratio, num_classes):
         self.original_dataset, self.poison_ratio, self.num_classes = original_dataset, poison_ratio, num_classes
         self.poison_indices = set(np.random.choice(len(self), int(len(self) * self.poison_ratio), replace=False))
 
@@ -93,3 +93,41 @@ class LabelFlippingDataset(Dataset):
             return img, random.choice(possible_wrong_labels)
         return img, label
 
+
+# --- [新增] 标签洗牌攻击 (Label Shuffling) ---
+class LabelShufflingDataset(Dataset):
+    """
+    一个为数据集实现“标签洗牌”攻击的包装器。
+    它会提取所有原始标签，在内部将它们完全打乱，
+    然后再将打乱后的标签重新分配给原始图片。
+    """
+
+    def __init__(self, original_dataset):
+        self.original_dataset = original_dataset
+
+        # print("    [攻击数据] 正在初始化标签洗牌... (这可能需要一点时间)")
+
+        # 1. 提取所有原始标签
+        #    (这步可能较慢，但只在客户端初始化时执行一次)
+        original_labels = []
+        for i in range(len(self.original_dataset)):
+            _, label = self.original_dataset[i]
+            original_labels.append(label)
+
+        # 2. 复制并打乱标签列表
+        self.shuffled_labels = original_labels.copy()
+        random.shuffle(self.shuffled_labels)
+
+        # print("    [攻击数据] 标签洗牌初始化完成。")
+
+    def __len__(self):
+        return len(self.original_dataset)
+
+    def __getitem__(self, idx):
+        # 1. 获取原始图片 (忽略其原始标签)
+        img, _ = self.original_dataset[idx]
+
+        # 2. 分配一个新的、被打乱的标签
+        shuffled_label = self.shuffled_labels[idx]
+
+        return img, shuffled_label
