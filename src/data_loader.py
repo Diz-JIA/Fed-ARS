@@ -1,5 +1,5 @@
 from torchvision import datasets, transforms
-from torch.utils.data import Subset, DataLoader
+from torch.utils.data import Subset, DataLoader, random_split
 import numpy as np
 
 
